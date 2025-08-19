@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+
+  <style>
+    /* Base styles */
+    :root { 
+      font: 12px/16px Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial; 
+    }
+    
+    body {
+      background: var(--figma-color-bg);
+      color: var(--figma-color-text);
+      min-width: 320px;
+    }
+
+    /* Layout utilities */
+    .stack > * + * {
+      margin-top: 12px;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    /* Form elements */
+    .field {
+      width: 100%;
+      height: 32px;
+      padding: 6px 10px;
+      background: var(--figma-color-bg-secondary);
+      border: 1px solid var(--figma-color-border);
+      border-radius: 6px;
+      color: var(--figma-color-text);
+      outline: none;
+    }
+
+    .field::placeholder {
+      color: var(--figma-color-text-tertiary);
+    }
+    
+    .field:focus {
+      border-color: var(--figma-color-border-selected);
+      box-shadow: 0 0 0 1px var(--figma-color-border-selected);
+    }
+
+    /* Buttons */
+    .btn {
+      height: 24px;
+      padding: 0 6px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 16px;
+      font-weight: 500;
+      background: var(--figma-color-bg-secondary);
+      border: 1px solid var(--figma-color-border);
+      color: var(--figma-color-text-secondary);
+    }
+
+    .btn:hover {
+      outline: none;
+      box-shadow: 0 0 0 1px var(--figma-color-border-selected);
+      color: var(--figma-color-text);
+    }
+
+    .btn--primary {
+      background: var(--figma-color-bg-brand);
+      color: var(--figma-color-text-onbrand);
+      border-color: transparent;
+    }
+
+    /* Status and scope elements */
+    #status {
+      font-size: 11px;
+      color: #888;
+      margin-top: 4px;
+      text-align: left;
+    }
+    
+    #scope {
+      color: var(--figma-color-text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: block;
+      max-width: 100%;
+      text-align: center;
+      padding: 8px;
+      border-radius: 6px;
+      background: var(--figma-color-bg-secondary);
+    }
+
+    /* Section titles */
+    .section-title {
+      font-size: 9px;
+      font-weight: 600;
+      color: var(--figma-color-text-secondary);
+      margin-top: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    /* Tighten spacing between titles and their button rows */
+    .section-title + .row { margin-top: 2px; }
+    /* Add comfortable spacing between button rows and the title that follows */
+    .row + .section-title { margin-top: 12px; }
+
+    /* Danger text button variant for lightweight actions */
+    .text-btn { background: transparent; border: none; padding: 0; color: inherit; cursor: pointer; }
+    .text-btn--danger { color: var(--figma-color-text-danger); font-size: 12px; }
+    .text-btn--danger:hover { text-decoration: underline; }
+    
+    /* Reference section styles */
+    .reference-section {
+      margin-top: 16px;
+      padding: 12px;
+      background: var(--figma-color-bg-secondary);
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    
+    .reference-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--figma-color-text);
+    }
+    
+    .reference-group {
+      margin-bottom: 12px;
+    }
+    
+    .reference-group:last-child {
+      margin-bottom: 0;
+    }
+    
+    .reference-label {
+      font-weight: 500;
+      color: var(--figma-color-text);
+      margin-bottom: 4px;
+    }
+    
+    .reference-content {
+      color: var(--figma-color-text-secondary);
+    }
+    
+    .reference-item {
+      margin-bottom: 8px;
+    }
+    
+    .reference-item:last-child {
+      margin-bottom: 0;
+    }
+    
+    .section-content {
+      color: var(--figma-color-text-secondary);
+    }
+    
+    .code-inline {
+      font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+      background: var(--figma-color-bg-tertiary);
+      padding: 2px 4px;
+      border-radius: 3px;
+      color: var(--figma-color-text);
+    }
+  </style>
+</head>
+<body>
+  <div class="section stack">
+    <div class="label" style="display:flex; align-items:center; justify-content: space-between; gap:8px; background: var(--figma-color-bg-secondary); padding: 2px 12px 2px 2px; border-radius: 6px;">
+      <div id="scope" style="color:var(--figma-color-text-secondary); flex:1; text-align:left;">Inside: #Current page</div>
+      <button class="text-btn text-btn--danger" id="clear-selection" title="Clear current selection" style="display:none;">Clear (esc)</button>
+    </div>
+
+    <div class="row" style="align-items: flex-end; gap: 4px;">
+      <input id="searchInput" class="field" type="text" placeholder="Enter your search..." style="flex: 1;" />
+      <button class="btn btn--primary" id="run" style="height: 32px;">Search</button>
+      <button class="btn" style="display: none; background: var(--figma-color-bg-danger); color: var(--figma-color-text-onbrand); border-color: transparent; height: 32px;" id="cancel">Cancel</button>
+    </div>
+    <div id="status" class="label" role="status" style="font-size: 11px; margin-bottom: 8px;">Use symbols to create advanced searches for selection.</div>
+    <div style="display: none; font-size: 12px; color: #888; margin-top: 4px;">
+      Add "--f" to stop at first match, "--fe" for first match in each scope, "--h" for hidden only, "--a" for all layers.
+    </div>
+
+    <div class="section-title">Layer Types</div>
+    <div class="row">
+      <button class="btn" data-symbol="#"># Page</button>
+      <button class="btn" data-symbol="$">$ Section</button>
+      <button class="btn" data-symbol="@">@ Frame</button>
+      <button class="btn" data-symbol="&">& Image</button>
+      <button class="btn" data-symbol="%">% Shape</button>
+      <button class="btn" data-symbol="=">= Text</button>
+      <button class="btn" data-symbol="!">! Instance</button>
+      <button class="btn" data-symbol="?">? Component</button>
+      <button class="btn">/ Child</button>
+      <button class="btn">// Direct</button>
+    </div>
+
+    <div class="section-title">Modifiers</div>
+    <div class="row">
+      <button class="btn" data-modifier="--f">--f First Match</button>
+      <button class="btn" data-modifier="--fe">--fe First Each</button>
+      <button class="btn" data-modifier="--h">--h Hidden Only</button>
+      <button class="btn" data-modifier="--a">--a All Layers</button>
+    </div>
+
+    <div class="reference-section">
+      <div class="reference-title">Quick Reference</div>
+
+      <div class="reference-group">
+        <div class="reference-label">Search Types:</div>
+        <div class="section-content" style="margin-bottom: 8px;">Add each type before typing the name of the layer.</div>
+        <div class="reference-content">
+          <div class="reference-item"><span class="code-inline">#</span> Page</div>
+          <div class="reference-item"><span class="code-inline">$</span> Section</div>
+          <div class="reference-item"><span class="code-inline">@</span> Frame</div>
+          <div class="reference-item"><span class="code-inline">!</span> Instance</div>
+          <div class="reference-item"><span class="code-inline">?</span> Component</div>
+          <div class="reference-item"><span class="code-inline">&</span> Image</div>
+          <div class="reference-item"><span class="code-inline">%</span> Shape</div>
+          <div class="reference-item"><span class="code-inline">=</span> Text</div>
+        </div>
+      </div>
+
+      <div class="reference-group">
+        <div class="reference-label">Search Scope:</div>
+        <div class="section-content" style="margin-bottom: 8px;">Add these symbols <em>before each</em> nested layer to signify nesting. If placed <em>at the start</em> of a query with a current selection, it will search inside the selection but exclude the current selection from being selectable.</div>
+        <div class="reference-content">
+          <div class="reference-item" style="display: flex; align-items: flex-start;">
+            <span class="code-inline" style="margin-right: 8px; flex-shrink: 0;">/</span>
+            <div>
+              <div>Nested search (all descendants).</div>
+            </div>
+          </div>
+          <div class="reference-item" style="display: flex; align-items: flex-start;">
+            <span class="code-inline" style="margin-right: 8px; flex-shrink: 0;">//</span>
+            <div>
+              <div>Direct children only (one level deep).</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="reference-group">
+        <div class="reference-label">Modifiers:</div>
+        <div class="section-content" style="margin-bottom: 8px;">Add these modifiers <em>at the end of your query</em> to modify search behavior.</div>
+        <div class="reference-content">
+          <div class="reference-item"><span class="code-inline">--f</span> Stop at first match found.</div>
+          <div class="reference-item"><span class="code-inline">--fe</span> Stop at first match found in each scope.</div>
+          <div class="reference-item"><span class="code-inline">--h</span> Search hidden layers only.</div>
+          <div class="reference-item"><span class="code-inline">--a</span> Search all layers (hidden and visible).</div>
+        </div>
+        <div class="section-content" style="margin-top: 8px; color: var(--figma-color-text-danger); font-size: 10px; line-height: 1.3;">
+          <strong>Performance Note:</strong> Using <span class="code-inline">--h</span> (hidden only) or <span class="code-inline">--a</span> (all layers) will significantly slow down search performance until the file is reloaded or closed and reopened.
+        </div>
+      </div>
+
+      <div class="reference-group">
+        <div class="reference-label">Search Path:</div>
+        <div class="section-content">Build a comprehensive query as a path to find a specific set of layers.</div>
+      </div>
+
+      <div class="reference-group">
+        <div class="reference-label">Example:</div>
+        <div class="section-content"><span class="code-inline">#Name/@Other Name/!Last Name --fe</span></div>
+        <div class="section-content" style="margin-top: 4px;">Search for a page called <span class="code-inline">"Name"</span> and switch to it. Then, within that page, search for frames called <span class="code-inline">"Other Name"</span>. Then within those frames, search for instances called <span class="code-inline">"Last Name"</span> and, if there are multiple matches, select the first match in each scope.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const input=document.getElementById('searchInput'); const statusEl=document.getElementById('status');
+    const symbolButtons=document.querySelectorAll('[data-symbol]'); const modifierButtons=document.querySelectorAll('[data-modifier]');
+    const runBtn=document.getElementById('run');
+    const cancelBtn=document.getElementById('cancel');
+    const clearBtn=document.getElementById('clear-selection');
+
+    // Focus the input when the plugin loads and request last query
+    setTimeout(() => {
+      input.focus();
+      parent.postMessage({ pluginMessage: { type: 'uiReady' } }, '*');
+    }, 100);
+    
+    // Persist last written query (debounced)
+    let saveTimer;
+    input.addEventListener('input', () => {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        parent.postMessage({ pluginMessage: { type: 'updateLastQuery', query: input.value } }, '*');
+      }, 150);
+    });
+    input.addEventListener('blur',()=>setTimeout(()=>input.focus(),10));
+    input.addEventListener('keydown',e=>{ if(e.key==='Enter') performSearch(); if(e.key==='Escape') parent.postMessage({ pluginMessage: { type: 'clearSelection' } }, '*'); });
+    runBtn.addEventListener('click',performSearch);
+    cancelBtn.addEventListener('click',cancelSearch);
+    clearBtn.addEventListener('click',()=>{
+      parent.postMessage({ pluginMessage: { type: 'clearSelection' } }, '*');
+    });
+
+    symbolButtons.forEach(btn=>{
+      btn.addEventListener('click',()=>{
+        const s=btn.dataset.symbol, st=input.selectionStart??input.value.length, en=input.selectionEnd??st;
+        input.setRangeText(s,st,en,'end'); input.focus();
+      });
+    });
+
+    // Handle special buttons without data-symbol
+    document.querySelectorAll('.btn').forEach(btn => {
+      if (!btn.dataset.symbol && !btn.dataset.modifier && btn.textContent === '/ Child') {
+        btn.addEventListener('click', () => {
+          const st = input.selectionStart ?? input.value.length;
+          const en = input.selectionEnd ?? st;
+          input.setRangeText('/', st, en, 'end');
+          input.focus();
+        });
+      } else if (!btn.dataset.symbol && !btn.dataset.modifier && btn.textContent === '// Direct') {
+        btn.addEventListener('click', () => {
+          const st = input.selectionStart ?? input.value.length;
+          const en = input.selectionEnd ?? st;
+          input.setRangeText('//', st, en, 'end');
+          input.focus();
+        });
+      }
+    });
+
+    modifierButtons.forEach(btn=>{
+      btn.addEventListener('click',()=>{
+        const modifier=btn.dataset.modifier;
+        const currentValue = input.value.trim();
+        
+        // Remove any existing modifiers from the end
+        const cleanValue = currentValue.replace(/\s*--[fhe]\s*$/g, '');
+        
+        // Check if this modifier is already present
+        if (cleanValue.includes(modifier)) {
+          // Remove this specific modifier if it's already there
+          input.value = cleanValue.replace(new RegExp(`\\s*${modifier}\\s*`, 'g'), '');
+        } else {
+          // Add the new modifier
+          input.value = cleanValue + ' ' + modifier;
+        }
+        input.focus();
+      });
+    });
+
+    function performSearch(){
+      const q=input.value.trim(); if(!q){set('Please enter a search query','err');return;}
+      set('Searching…'); 
+      runBtn.style.display = 'none';
+      cancelBtn.style.display = 'inline-block';
+      parent.postMessage({ pluginMessage:{ type:'search', query:q } }, '*');
+    }
+    
+    function cancelSearch(){
+      set('Search cancelled');
+      runBtn.style.display = 'inline-block';
+      cancelBtn.style.display = 'none';
+      parent.postMessage({ pluginMessage:{ type:'cancel' } }, '*');
+    }
+    
+    function set(msg,kind){
+      statusEl.textContent=msg;
+      statusEl.style.color = kind==='err' ? 'var(--figma-color-text-danger)'
+        : kind==='ok' ? 'var(--figma-color-text-success)' : 'var(--figma-color-text-secondary)';
+    }
+    window.onmessage = (e)=>{
+      const m=e.data?.pluginMessage; if(!m) return;
+      if(m.type==='selection'){
+        const scopeEl = document.getElementById('scope');
+        const clearBtnEl = document.getElementById('clear-selection');
+        scopeEl.textContent = `${m.label}`;
+        // Show clear button only when scope is not the whole page
+        const isPageOnly = m.label && /^Inside:\s*#/.test(m.label) && m.label.indexOf(',') === -1;
+        clearBtnEl.style.display = isPageOnly ? 'none' : 'inline-block';
+        return;
+      }
+      if(m.type==='initQuery'){
+        // Prefill with last query and select all so typing replaces it
+        input.value = m.query || '';
+        input.focus();
+        try { input.setSelectionRange(0, input.value.length); } catch {}
+        return;
+      }
+      if(m.type==='searchComplete'){
+        runBtn.style.display = 'inline-block';
+        cancelBtn.style.display = 'none';
+        if(m.count>0) set(`Found and selected ${m.count} layer${m.count>1?'s':''}`,'ok');
+        else if(m.total>0) set(m.message||'Found items but could not select them');
+        else set(m.message||'No matching layers found','err');
+      }
+    };
+  </script>
+</body>
+</html>
