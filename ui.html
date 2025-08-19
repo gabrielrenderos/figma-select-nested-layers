@@ -278,11 +278,11 @@
     const cancelBtn=document.getElementById('cancel');
     const clearBtn=document.getElementById('clear-selection');
 
-    // Focus the input when the plugin loads and request last query
-    setTimeout(() => {
-      input.focus();
+    // Focus the input when the plugin loads and request last query (no artificial delay)
+    requestAnimationFrame(() => {
       parent.postMessage({ pluginMessage: { type: 'uiReady' } }, '*');
-    }, 100);
+      input.focus();
+    });
     
     // Persist last written query (debounced)
     let saveTimer;

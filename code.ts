@@ -9,6 +9,13 @@ figma.skipInvisibleInstanceChildren = true;
 
 // Keys for persistent storage
 const LAST_QUERY_KEY = 'lastQuery';
+let cachedLastQuery: string | null = null;
+const lastQueryLoad = (async () => {
+  try {
+    const v = await figma.clientStorage.getAsync(LAST_QUERY_KEY);
+    cachedLastQuery = (typeof v === 'string' && v.length > 0) ? v : null;
+  } catch {}
+})();
 
 // Global search state flags
 let STOP_ON_FIRST = false;  // Stop at first match (--f modifier)
@@ -303,15 +310,20 @@ figma.ui.onmessage = async (msg: { type: string; query?: string }) => {
   } else if (msg.type === 'updateLastQuery') {
     try {
       await figma.clientStorage.setAsync(LAST_QUERY_KEY, msg.query ?? '');
+      cachedLastQuery = msg.query ?? '';
     } catch {}
   } else if (msg.type === 'uiReady') {
     // UI is ready: send back the last saved query (if any)
-    try {
-      const q = await figma.clientStorage.getAsync(LAST_QUERY_KEY);
-      if (typeof q === 'string' && q.length > 0) {
-        figma.ui.postMessage({ type: 'initQuery', query: q });
-      }
-    } catch {}
+    if (cachedLastQuery) {
+      figma.ui.postMessage({ type: 'initQuery', query: cachedLastQuery });
+    } else {
+      try {
+        await lastQueryLoad;
+        if (cachedLastQuery) {
+          figma.ui.postMessage({ type: 'initQuery', query: cachedLastQuery });
+        }
+      } catch {}
+    }
   }
 };
 
