@@ -182,7 +182,7 @@
     </div>
     <div id="status" class="label" role="status" style="font-size: 11px; margin-bottom: 8px;">Use symbols to create advanced searches for selection.</div>
     <div style="display: none; font-size: 12px; color: #888; margin-top: 4px;">
-      Add "--f" to stop at first match, "--fe" for first match in each scope, "--h" for hidden only, "--a" for all layers.
+      Add "--f" to stop at first match, "--fe" for first match in each scope, "--h" for hidden only, "--a" for all layers, "--i" to pick an index (e.g. --i2).
     </div>
 
     <div class="section-title">Layer Types</div>
@@ -203,6 +203,7 @@
     <div class="row">
       <button class="btn" data-modifier="--f">--f First Match</button>
       <button class="btn" data-modifier="--fe">--fe First Each</button>
+      <button class="btn" data-modifier="--i">--i Index Select</button>
       <button class="btn" data-modifier="--h">--h Hidden Only</button>
       <button class="btn" data-modifier="--a">--a All Layers</button>
     </div>
@@ -250,6 +251,7 @@
         <div class="reference-content">
           <div class="reference-item"><span class="code-inline">--f</span> Stop at first match found.</div>
           <div class="reference-item"><span class="code-inline">--fe</span> Stop at first match found in each scope.</div>
+          <div class="reference-item"><span class="code-inline">--i#</span> Select the <em>#</em>-th match in visual order per scope (e.g. <span class="code-inline">--i2</span>). If no number is provided (<span class="code-inline">--i</span>), it defaults to the first (like <span class="code-inline">--fe</span>).</div>
           <div class="reference-item"><span class="code-inline">--h</span> Search hidden layers only.</div>
           <div class="reference-item"><span class="code-inline">--a</span> Search all layers (hidden and visible).</div>
         </div>
@@ -331,8 +333,8 @@
         const modifier=btn.dataset.modifier;
         const currentValue = input.value.trim();
         
-        // Remove any existing modifiers from the end
-        const cleanValue = currentValue.replace(/\s*--[fhe]\s*$/g, '');
+        // Remove any known modifier if it's dangling at the very end (helps keep spacing tidy)
+        const cleanValue = currentValue.replace(/\s*--(?:fe|[fhai])\s*$/g, '');
         
         // Check if this modifier is already present
         if (cleanValue.includes(modifier)) {
