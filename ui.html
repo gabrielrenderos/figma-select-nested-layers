@@ -182,7 +182,7 @@
     </div>
     <div id="status" class="label" role="status" style="font-size: 11px; margin-bottom: 8px;">Use symbols to create advanced searches for selection.</div>
     <div style="display: none; font-size: 12px; color: #888; margin-top: 4px;">
-      Add "--f" to stop at first match, "--fe" for first match in each scope, "--h" for hidden only, "--a" for all layers, "--i" to pick an index (e.g. --i2).
+      Add "--f" to stop at first match, "--fe" for first match in each scope, "--h" for hidden only, "--a" for all layers, "--#" for global index (e.g. --3), or "--#e" for per-scope index on the last part (e.g. --2e).
     </div>
 
     <div class="section-title">Layer Types</div>
@@ -203,7 +203,8 @@
     <div class="row">
       <button class="btn" data-modifier="--f">--f First Match</button>
       <button class="btn" data-modifier="--fe">--fe First Each</button>
-      <button class="btn" data-modifier="--i">--i Index Select</button>
+      <button class="btn" data-modifier="--#">--# Global Index</button>
+      <button class="btn" data-modifier="--#e">--#e Per-scope Index</button>
       <button class="btn" data-modifier="--h">--h Hidden Only</button>
       <button class="btn" data-modifier="--a">--a All Layers</button>
     </div>
@@ -251,7 +252,8 @@
         <div class="reference-content">
           <div class="reference-item"><span class="code-inline">--f</span> Stop at first match found.</div>
           <div class="reference-item"><span class="code-inline">--fe</span> Stop at first match found in each scope.</div>
-          <div class="reference-item"><span class="code-inline">--i#</span> Select the <em>#</em>-th match in visual order per scope (e.g. <span class="code-inline">--i2</span>). If no number is provided (<span class="code-inline">--i</span>), it defaults to the first (like <span class="code-inline">--fe</span>).</div>
+          <div class="reference-item"><span class="code-inline">--#</span> Select the <em>#</em>-th match <em>overall</em> in visual order (e.g. <span class="code-inline">--3</span>). This is global across all matched layers, not per scope.</div>
+          <div class="reference-item"><span class="code-inline">--#e</span> Select the <em>#</em>-th match <em>in each scope</em> on the final part (e.g. <span class="code-inline">--2e</span> selects the 2nd in each matched parent scope).</div>
           <div class="reference-item"><span class="code-inline">--h</span> Search hidden layers only.</div>
           <div class="reference-item"><span class="code-inline">--a</span> Search all layers (hidden and visible).</div>
         </div>
@@ -334,15 +336,38 @@
         const currentValue = input.value.trim();
         
         // Remove any known modifier if it's dangling at the very end (helps keep spacing tidy)
-        const cleanValue = currentValue.replace(/\s*--(?:fe|[fhai])\s*$/g, '');
+        const cleanValue = currentValue.replace(/\s*--(?:fe|[fha]|\d+e?|\d+e)\s*$/g, '');
         
-        // Check if this modifier is already present
-        if (cleanValue.includes(modifier)) {
-          // Remove this specific modifier if it's already there
-          input.value = cleanValue.replace(new RegExp(`\\s*${modifier}\\s*`, 'g'), '');
+        // Special handling for --#: insert a "--" and place cursor after it so user can type the number.
+        if (modifier === '--#') {
+          // Remove any existing --#
+          const stripped = cleanValue.replace(/\s*--\d+\s*/g, ' ').trim();
+          const insertion = (stripped + ' --').trim();
+          input.value = insertion;
+          requestAnimationFrame(() => {
+            input.focus();
+            try { input.setSelectionRange(insertion.length, insertion.length); } catch {}
+          });
+        } else if (modifier === '--#e') {
+          // Remove any existing --#e, then insert "--" and place cursor before adding 'e' to let user type number
+          const stripped = cleanValue.replace(/\s*--\d+e\s*/g, ' ').trim();
+          const insertion = (stripped + ' --').trim();
+          input.value = insertion + 'e';
+          requestAnimationFrame(() => {
+            input.focus();
+            // place cursor between the dashes and trailing 'e'
+            const pos = insertion.length;
+            try { input.setSelectionRange(pos, pos); } catch {}
+          });
         } else {
-          // Add the new modifier
-          input.value = cleanValue + ' ' + modifier;
+          // Check if this modifier is already present
+          if (cleanValue.includes(modifier)) {
+            // Remove this specific modifier if it's already there
+            input.value = cleanValue.replace(new RegExp(`\\s*${modifier}\\s*`, 'g'), '');
+          } else {
+            // Add the new modifier
+            input.value = cleanValue + ' ' + modifier;
+          }
         }
         input.focus();
       });

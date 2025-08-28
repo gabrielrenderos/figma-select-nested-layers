@@ -156,18 +156,21 @@ interface SearchModifiers {
   hiddenOnly: boolean;
   allLayers: boolean;
   cleanQuery: string;
-  // --i#: index selection for the last query part (1-based)
+  // --# (e.g., --3): global index selection across all matches (1-based)
   indexPick?: number | null;
+  // --#e (e.g., --3e): per-scope index selection on the final part (1-based)
+  indexPickEach?: number | null;
 }
 
 /**
  * Parses search modifiers from the query string.
  * Recognized modifiers:
- *  - --f   Stop at the first match overall.
- *  - --fe  Stop at the first match within each scope on the last part.
- *  - --h   Only include hidden nodes on the final part; intermediate parts include both.
- *  - --a   Include both hidden and visible nodes for all parts.
- *  - --i#  Select the #th match per scope in visual order on the last part; bare --i defaults to 1.
+ *  - --f     Stop at the first match overall.
+ *  - --fe    Stop at the first match within each scope on the last part.
+ *  - --h     Only include hidden nodes on the final part; intermediate parts include both.
+ *  - --a     Include both hidden and visible nodes for all parts.
+ *  - --#     Global index across all matched layers (e.g. --3 picks the 3rd overall).
+ *  - --#e    Per-scope index on the last part (e.g. --2e picks 2nd inside each scope).
  * Returns the modifiers and the cleaned query without modifiers. Modifiers may appear in any order.
  */
 function parseModifiers(query: string): SearchModifiers {
@@ -177,7 +180,8 @@ function parseModifiers(query: string): SearchModifiers {
     hiddenOnly: false,      // --h: search only hidden layers
     allLayers: false,       // --a: search both hidden and visible layers
     cleanQuery: query,
-    indexPick: null as number | null
+    indexPick: null as number | null,
+    indexPickEach: null as number | null
   };
   
   let cleanQuery = query.trim();
@@ -187,21 +191,28 @@ function parseModifiers(query: string): SearchModifiers {
     modifiers.firstMatchEach = true;
     cleanQuery = cleanQuery.replace(/\s*--fe\s*/g, '').trim();
   }
-  // Extract --i# (or bare --i which defaults to 1). If multiple are present, the last one wins.
-  const indexPattern = /--i(\d*)/g;
+  // Extract --#e (numeric) per-scope index for the last part FIRST (so we don't consume the number as --#)
+  const idxEachPattern = /--(\d+)e/g;
   let im: RegExpExecArray | null;
+  let lastIndexPickEach: number | null = null;
+  while ((im = idxEachPattern.exec(cleanQuery)) !== null) {
+    const num = parseInt(im[1], 10);
+    if (!Number.isNaN(num) && num >= 1) lastIndexPickEach = num;
+  }
+  if (lastIndexPickEach !== null) modifiers.indexPickEach = lastIndexPickEach;
+  // Remove all occurrences of --#e
+  cleanQuery = cleanQuery.replace(/\s*--\d+e\s*/g, ' ').trim();
+
+  // Extract --# (numeric) global index (e.g., --3). If multiple, the last wins.
+  const idxNumPattern = /--(\d+)/g;
   let lastIndexPick: number | null = null;
-  while ((im = indexPattern.exec(cleanQuery)) !== null) {
-    const num = im[1] ? parseInt(im[1], 10) : 1;
-    if (!Number.isNaN(num) && num >= 1) {
-      lastIndexPick = num;
-    }
+  while ((im = idxNumPattern.exec(cleanQuery)) !== null) {
+    const num = parseInt(im[1], 10);
+    if (!Number.isNaN(num) && num >= 1) lastIndexPick = num;
   }
-  if (lastIndexPick !== null) {
-    modifiers.indexPick = lastIndexPick;
-  }
-  // Remove all occurrences of --i# (or --i) from the query
-  cleanQuery = cleanQuery.replace(/\s*--i\d*\s*/g, ' ').trim();
+  if (lastIndexPick !== null) modifiers.indexPick = lastIndexPick;
+  // Remove all occurrences of --#
+  cleanQuery = cleanQuery.replace(/\s*--\d+\s*/g, ' ').trim();
   
   const modifierPattern = /\s*--([fha])\s*/g;
   let match;
@@ -501,57 +512,246 @@ async function walk(root: ChildrenMixin, step:(n:SceneNode)=>boolean, modifiers?
  * @returns Array of search results with node and path information
  */
 async function performSearch(query: string, movedToPage: boolean = false, modifiers?: SearchModifiers): Promise<SearchResult[]> {
-  // Visual order comparator used by --fe/--i# on the last query part.
-  // Rules:
-  //  - Shallower nodes (higher up the hierarchy) come before deeper nodes.
-  //  - For siblings inside an Auto Layout frame:
-  //      * VERTICAL: topmost-first by y (ties broken by x, then paint order).
-  //      * HORIZONTAL: leftmost-first by x (ties broken by y, then paint order).
-  //  - Otherwise: paint order wins, frontmost-first (higher children index).
-  const ancestorChain = (n: SceneNode): BaseNode[] => {
-    const chain: BaseNode[] = [];
-    let cur: BaseNode | null = n;
+  // Visual order comparator used by --fe/--#e and by global --#.
+  // It prioritizes visible positioning over paint/z-order:
+  //  - If both nodes share an Auto Layout ancestor, use that ancestor's axis
+  //    (VERTICAL => absolute Y ascending; HORIZONTAL => absolute X ascending).
+  //  - Otherwise fall back to absolute Y, then absolute X ascending.
+  //  - Final tie-breaker: paint order (frontmost-first) at the nearest common ancestor.
+  const getAbsXY = (n: SceneNode): { ax: number; ay: number } => {
+    const m = ((n as any).absoluteTransform || [[1,0,0],[0,1,0]]) as [[number,number,number],[number,number,number]];
+    return { ax: m[0][2], ay: m[1][2] };
+  };
+  const buildAncestorList = (n: BaseNode): any[] => {
+    const list: any[] = [];
+    let cur: any = n;
     while (cur) {
-      chain.unshift(cur);
-      cur = (cur as any).parent || null;
+      list.unshift(cur);
+      cur = cur.parent || null;
       if (!cur || !('children' in cur)) break;
     }
-    return chain;
+    return list;
   };
-  const compareSiblings = (parent: any, a: any, b: any): number => {
-    const la = (typeof parent?.layoutMode === 'string') ? parent.layoutMode : 'NONE';
-    if (la === 'VERTICAL') {
-      const dy = (a.y ?? 0) - (b.y ?? 0);
-      if (Math.abs(dy) > 0.5) return dy; // topmost-first
-      const dx = (a.x ?? 0) - (b.x ?? 0);
-      if (Math.abs(dx) > 0.5) return dx; // left-to-right tie-breaker
-    } else if (la === 'HORIZONTAL') {
-      const dx = (a.x ?? 0) - (b.x ?? 0);
-      if (Math.abs(dx) > 0.5) return dx; // leftmost-first
-      const dy = (a.y ?? 0) - (b.y ?? 0);
-      if (Math.abs(dy) > 0.5) return dy; // top-to-bottom tie-breaker
+  const nearestCommonAutoLayout = (a: SceneNode, b: SceneNode): { parent: any; mode: 'VERTICAL'|'HORIZONTAL'|null } | null => {
+    const aa = buildAncestorList(a);
+    const mm = new Map<string, 'VERTICAL'|'HORIZONTAL'>();
+    for (const x of aa) {
+      const lm = (typeof x?.layoutMode === 'string') ? x.layoutMode : 'NONE';
+      if (lm === 'VERTICAL' || lm === 'HORIZONTAL') mm.set(x.id || String(x), lm);
     }
-    // Fallback to paint order: higher index is frontmost-first
-    const kids: readonly BaseNode[] = (parent?.children || []) as readonly BaseNode[];
-    const ia = kids.indexOf(a);
-    const ib = kids.indexOf(b);
-    return ib - ia;
+    const bb = buildAncestorList(b);
+    for (const y of bb) {
+      const lm = (typeof y?.layoutMode === 'string') ? y.layoutMode : 'NONE';
+      if ((lm === 'VERTICAL' || lm === 'HORIZONTAL') && mm.has(y.id || String(y))) {
+        return { parent: y, mode: lm };
+      }
+    }
+    return null;
+  };
+  const nearestCommonAncestor = (a: SceneNode, b: SceneNode): any | null => {
+    const aa = buildAncestorList(a);
+    const set = new Set(aa);
+    const bb = buildAncestorList(b);
+    for (const y of bb) {
+      if (set.has(y)) return y;
+    }
+    return null;
+  };
+  const depthFrom = (scope: any, node: SceneNode): number => {
+    let depth = 0;
+    let cur: any = node;
+    while (cur && cur !== scope) {
+      cur = cur.parent;
+      if (!cur) break;
+      depth++;
+    }
+    return depth;
+  };
+  const compareWithinScope = (scope: any, a: SceneNode, b: SceneNode): number => {
+    const scopeMode = (typeof scope?.layoutMode === 'string') ? scope.layoutMode : 'NONE';
+    if (scopeMode === 'VERTICAL' || scopeMode === 'HORIZONTAL') {
+      // 1) Prioritize visual axis ordering when the last scope is Auto Layout
+      const pa: any = (a as any).parent;
+      const pb: any = (b as any).parent;
+      const ma = (typeof pa?.layoutMode === 'string') ? pa.layoutMode : 'NONE';
+      const mb = (typeof pb?.layoutMode === 'string') ? pb.layoutMode : 'NONE';
+      const { ax: axA, ay: ayA } = getAbsXY(a);
+      const { ax: axB, ay: ayB } = getAbsXY(b);
+      if (ma === 'VERTICAL' && mb === 'VERTICAL') {
+        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+      } else if (ma === 'HORIZONTAL' && mb === 'HORIZONTAL') {
+        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+      } else {
+        // If immediate parents do not both share axis, still use the scope's axis with absolute coords
+        if (scopeMode === 'VERTICAL') {
+          const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+          const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+        } else {
+          const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+          const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+        }
+      }
+      // 2) If axis order ties, prefer direct children (shallower depth from the specified scope)
+      const da = depthFrom(scope, a);
+      const db = depthFrom(scope, b);
+      if (da !== db) return da - db;
+      // 3) Fall back to z-order: nearest common ancestor paint order (frontmost-first)
+      const lca = nearestCommonAncestor(a, b);
+      if (lca && 'children' in lca) {
+        const path = (root: any, node: any): number[] => {
+          const p: number[] = [];
+          let cur: any = node;
+          while (cur && cur !== root) {
+            const par: any = cur.parent;
+            if (!par || !('children' in par)) break;
+            const idx = (par.children as readonly BaseNode[]).indexOf(cur);
+            p.unshift(idx);
+            cur = par;
+          }
+          return p;
+        };
+        const paIdx = path(lca, a);
+        const pbIdx = path(lca, b);
+        const len = Math.max(paIdx.length, pbIdx.length);
+        for (let i = 0; i < len; i++) {
+          const aHas = i < paIdx.length;
+          const bHas = i < pbIdx.length;
+          if (!aHas && bHas) return -1;
+          if (aHas && !bHas) return 1;
+          if (aHas && bHas) {
+            if (paIdx[i] !== pbIdx[i]) return pbIdx[i] - paIdx[i];
+          }
+        }
+      }
+      return 0;
+    }
+    // If scope is not Auto Layout, defer to general visual comparator
+    return compareVisual(a, b);
+  };
+
+  const compareZFirstWithinScope = (scope: any, a: SceneNode, b: SceneNode): number => {
+    // 1) Paint order relative to nearest common ancestor (frontmost-first)
+    const lca = nearestCommonAncestor(a, b);
+    if (lca && 'children' in lca) {
+      const path = (root: any, node: any): number[] => {
+        const p: number[] = [];
+        let cur: any = node;
+        while (cur && cur !== root) {
+          const par: any = cur.parent;
+          if (!par || !('children' in par)) break;
+          const idx = (par.children as readonly BaseNode[]).indexOf(cur);
+          p.unshift(idx);
+          cur = par;
+        }
+        return p;
+      };
+      const paIdx = path(lca, a);
+      const pbIdx = path(lca, b);
+      const len = Math.max(paIdx.length, pbIdx.length);
+      for (let i = 0; i < len; i++) {
+        const aHas = i < paIdx.length;
+        const bHas = i < pbIdx.length;
+        if (!aHas && bHas) return -1; // shallower first
+        if (aHas && !bHas) return 1;  // deeper later
+        if (aHas && bHas) {
+          if (paIdx[i] !== pbIdx[i]) return pbIdx[i] - paIdx[i]; // frontmost-first
+        }
+      }
+    }
+    // 2) Fallback to absolute XY (top-left-first) when z-order is identical/ambiguous
+    const { ax: axA, ay: ayA } = getAbsXY(a);
+    const { ax: axB, ay: ayB } = getAbsXY(b);
+    const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+    const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+    return 0;
   };
   const compareVisual = (a: SceneNode, b: SceneNode): number => {
     if (a === b) return 0;
-    const ca = ancestorChain(a);
-    const cb = ancestorChain(b);
-    const len = Math.min(ca.length, cb.length);
-    for (let i = 0; i < len; i++) {
-      if (ca[i] !== cb[i]) {
-        const parent = i > 0 ? (ca[i - 1] as any) : null;
-        // If diverge at root (no common parent), keep original stable order
-        if (!parent || !('children' in parent)) return 0;
-        return compareSiblings(parent, ca[i], cb[i]);
+    const pa: any = (a as any).parent;
+    const pb: any = (b as any).parent;
+
+    // Prefer immediate-parent rules
+    if (pa && pa === pb && 'children' in pa) {
+      const mode = (typeof pa.layoutMode === 'string') ? pa.layoutMode : 'NONE';
+      const kids = pa.children as readonly BaseNode[];
+      if (mode === 'VERTICAL') {
+        const { ax: axA, ay: ayA } = getAbsXY(a);
+        const { ax: axB, ay: ayB } = getAbsXY(b);
+        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+        // tie-breaker within same parent by paint order (frontmost-first)
+        return kids.indexOf(b) - kids.indexOf(a);
+      }
+      if (mode === 'HORIZONTAL') {
+        const { ax: axA, ay: ayA } = getAbsXY(a);
+        const { ax: axB, ay: ayB } = getAbsXY(b);
+        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+        // tie-breaker within same parent by paint order (frontmost-first)
+        return kids.indexOf(b) - kids.indexOf(a);
+      }
+      // Same non-Auto Layout parent → paint order decides (frontmost-first)
+      return kids.indexOf(b) - kids.indexOf(a);
+    }
+
+    // Different parents: if immediate parents use Auto Layout (one or both), use visual axis ordering
+    const modeA = (typeof pa?.layoutMode === 'string') ? pa.layoutMode : 'NONE';
+    const modeB = (typeof pb?.layoutMode === 'string') ? pb.layoutMode : 'NONE';
+    const axisMode = modeA !== 'NONE' ? modeA : (modeB !== 'NONE' ? modeB : 'NONE');
+    if (axisMode !== 'NONE') {
+      const { ax: axA, ay: ayA } = getAbsXY(a);
+      const { ax: axB, ay: ayB } = getAbsXY(b);
+      if (axisMode === 'VERTICAL') {
+        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+      } else if (axisMode === 'HORIZONTAL') {
+        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+      } else {
+        // Mixed orientations: fall back to general visual top-left order
+        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+      }
+      // fall through to LCA paint order tie-breaker
+    }
+
+    // Different parents without both using Auto Layout: use nearest common ancestor paint order when possible
+    const lca = nearestCommonAncestor(a, b);
+    if (lca && 'children' in lca) {
+      const indexPathFrom = (root: any, node: any): number[] => {
+        const path: number[] = [];
+        let cur: any = node;
+        while (cur && cur !== root) {
+          const par: any = cur.parent;
+          if (!par || !('children' in par)) break;
+          const idx = (par.children as readonly BaseNode[]).indexOf(cur);
+          path.unshift(idx);
+          cur = par;
+        }
+        return path;
+      };
+      const paIdx = indexPathFrom(lca, a);
+      const pbIdx = indexPathFrom(lca, b);
+      const maxLen = Math.max(paIdx.length, pbIdx.length);
+      for (let i = 0; i < maxLen; i++) {
+        const aHas = i < paIdx.length;
+        const bHas = i < pbIdx.length;
+        if (!aHas && bHas) return -1; // shallower first
+        if (aHas && !bHas) return 1;  // deeper later
+        if (aHas && bHas) {
+          if (paIdx[i] !== pbIdx[i]) return pbIdx[i] - paIdx[i]; // frontmost-first at branch
+        }
       }
     }
-    // One is ancestor of the other: shallower (shorter chain) first
-    return ca.length - cb.length;
+
+    // Final fallback: absolute position
+    const { ax: axA, ay: ayA } = getAbsXY(a);
+    const { ax: axB, ay: ayB } = getAbsXY(b);
+    const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+    const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+    return 0;
   };
   // Parse query parts, handling // as a special separator for direct children
   const parts: { part: string; isDirectChild: boolean }[] = [];
@@ -657,7 +857,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         // Special global-selection indexed pick: when selection contains leaf nodes that match the query,
         // pick Nth across the selection regardless of parent scopes.
         const selected = (figma.currentPage.selection as SceneNode[]) || [];
-        const indexToPickGlobal = (modifiers?.indexPick ?? (modifiers?.firstMatchEach ? 1 : null));
+        const indexToPickGlobal = (modifiers?.indexPick ?? null);
         if (isLastPart && !modifiers?.firstMatch && !isChildSearch && indexToPickGlobal) {
           const gate = gateFor(searchType);
           const qLower = searchName.toLowerCase();
@@ -692,11 +892,11 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         for (const s of scopes) {
           if (SEARCH_CANCELLED) break;
           
-          // If last part and per-scope indexing requested, collect matches per-scope and pick the indexed one
-          if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPick ?? null))) {
+          // Per-scope pick for --fe (first in each scope) or --#e (Nth in each scope) on the last part.
+          if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPickEach ?? null))) {
             const gate = gateFor(searchType);
             const qLower = searchName.toLowerCase();
-            const indexToPick = (modifiers?.indexPick ?? 1);
+            const indexToPick = (modifiers?.indexPickEach ?? 1);
 
             const matches: SceneNode[] = [];
             // Consider the scope node itself if it matches and allowed by flags
@@ -776,7 +976,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 FOUND_ONE = true;
               }
             }
-            // Done with per-scope indexed pick; continue to next scope
+            // Done with per-scope first pick; continue to next scope
             continue;
           }
 
@@ -930,39 +1130,13 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         currentScope = rootResults.map(r => r.node);
       }
     } else {
-      // Special handling for per-scope index selection on the final part.
-      // Behaves like --fe when indexPick is 1; picks Nth in draw order per scope when --i# provided.
-      if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPick ?? null))) {
+      // Special handling for per-scope pick (--fe or --#e) on the final part.
+      if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPickEach ?? null))) {
         const perScope: SearchResult[] = [];
         const gate = gateFor(searchType);
         const qLower = searchName.toLowerCase();
 
-        // Build draw-order key: shallower-first across nesting, and within each parent higher z-index (frontmost) first
-        const drawKey = (n: SceneNode): number[] => {
-          const key: number[] = [];
-          for (let cur: BaseNode | null = n; cur && 'parent' in cur; cur = (cur as any).parent) {
-            const par = (cur as any).parent as any;
-            if (!par || !('children' in par)) break;
-            const idx = (par.children as readonly BaseNode[]).indexOf(cur);
-            key.unshift(idx);
-          }
-          return key;
-        };
-        const compareKeys = (a: number[], b: number[]): number => {
-          const maxLen = Math.max(a.length, b.length);
-          for (let i = 0; i < maxLen; i++) {
-            const aHas = i < a.length;
-            const bHas = i < b.length;
-            if (!aHas && bHas) return -1; // shallower first
-            if (aHas && !bHas) return 1;  // deeper later
-            if (aHas && bHas) {
-              if (a[i] !== b[i]) return b[i] - a[i]; // frontmost-first within the same parent
-            }
-          }
-          return 0;
-        };
-
-        const indexToPick = (modifiers?.indexPick ?? 1);
+        const indexToPick = (modifiers?.indexPickEach ?? 1);
 
         for (const parent of currentScope) {
           if (SEARCH_CANCELLED) break;
@@ -998,9 +1172,11 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
           }
 
           if (matches.length) {
-            const sorted = matches.map(n => ({ n, k: drawKey(n) }))
-                                  .sort((x, y) => compareKeys(x.k, y.k))
-                                  .map(x => x.n);
+            // If the last specified scope is Auto Layout, apply scope-aware rules:
+            const parentLayout = (typeof (parent as any)?.layoutMode === 'string') ? (parent as any).layoutMode : 'NONE';
+            const sorted = (parentLayout === 'VERTICAL' || parentLayout === 'HORIZONTAL')
+              ? matches.slice().sort((x, y) => compareWithinScope(parent, x, y))
+              : matches.slice().sort((x, y) => compareZFirstWithinScope(parent, x, y));
             const pick = sorted[indexToPick - 1] || null;
             if (pick) {
               const sym =
@@ -1059,6 +1235,20 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     const firstKey = searchCache.keys().next().value;
     if (firstKey) {
       searchCache.delete(firstKey);
+    }
+  }
+
+  // Apply global index (--#) at the very end across all selectable matches, using the same visual order
+  if ((modifiers?.indexPick ?? null) && results.length > 0) {
+    const selectable = results
+      .map(r => r.node)
+      .filter(node => 'id' in node && node.type !== 'PAGE') as SceneNode[];
+    const sorted = selectable.slice().sort(compareVisual);
+    const pick = sorted[Math.max(0, (modifiers!.indexPick as number) - 1)] || null;
+    if (pick) {
+      return results.filter(r => r.node === pick);
+    } else {
+      return [];
     }
   }
 
@@ -1466,3 +1656,4 @@ function getNodePath(node: SceneNode | PageNode | SectionNode): string {
   
   return parts.join('/');
 }
+
