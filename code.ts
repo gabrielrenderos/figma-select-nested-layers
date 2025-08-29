@@ -1174,9 +1174,8 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
           if (matches.length) {
             // If the last specified scope is Auto Layout, apply scope-aware rules:
             const parentLayout = (typeof (parent as any)?.layoutMode === 'string') ? (parent as any).layoutMode : 'NONE';
-            const sorted = (parentLayout === 'VERTICAL' || parentLayout === 'HORIZONTAL')
-              ? matches.slice().sort((x, y) => compareWithinScope(parent, x, y))
-              : matches.slice().sort((x, y) => compareZFirstWithinScope(parent, x, y));
+            // Always prioritize XY first; use z-order as tie-breaker via scope-aware or general rules
+            const sorted = matches.slice().sort((x, y) => compareWithinScope(parent, x, y));
             const pick = sorted[indexToPick - 1] || null;
             if (pick) {
               const sym =
