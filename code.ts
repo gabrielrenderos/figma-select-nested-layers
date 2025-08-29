@@ -522,6 +522,45 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     const m = ((n as any).absoluteTransform || [[1,0,0],[0,1,0]]) as [[number,number,number],[number,number,number]];
     return { ax: m[0][2], ay: m[1][2] };
   };
+  const getSize = (n: SceneNode): { w: number; h: number } => {
+    const w = ("width" in (n as any)) ? (n as any).width as number : 0;
+    const h = ("height" in (n as any)) ? (n as any).height as number : 0;
+    return { w: (isFinite(w) ? w : 0), h: (isFinite(h) ? h : 0) };
+  };
+  const buildRowComparator = (nodes: SceneNode[]): ((a: SceneNode, b: SceneNode) => number) => {
+    const heights: number[] = nodes.map(n => getSize(n).h || 0);
+    const avgH = heights.length ? (heights.reduce((s, v) => s + v, 0) / heights.length) : 0;
+    const rowEps = Math.max(8, Math.round(0.35 * (avgH || 24)));
+    const sameRow = (a: SceneNode, b: SceneNode): boolean => {
+      const { ay: yA } = getAbsXY(a);
+      const { ay: yB } = getAbsXY(b);
+      const hA = getSize(a).h || avgH || 24;
+      const hB = getSize(b).h || avgH || 24;
+      const cA = yA + hA / 2;
+      const cB = yB + hB / 2;
+      return Math.abs(cA - cB) <= rowEps;
+    };
+    return (a: SceneNode, b: SceneNode): number => {
+      if (a === b) return 0;
+      const { ax: xA, ay: yA } = getAbsXY(a);
+      const { ax: xB, ay: yB } = getAbsXY(b);
+      if (sameRow(a, b)) {
+        if (Math.abs(xA - xB) > 0.5) return xA - xB; // left-to-right within row
+        // tie-breaker: z-order via nearest common ancestor
+        const lca = nearestCommonAncestor(a, b);
+        if (lca && 'children' in lca) {
+          const kids = (lca.children as readonly BaseNode[]);
+          return kids.indexOf(b) - kids.indexOf(a);
+        }
+        return 0;
+      }
+      // Different rows: top rows first by minY
+      if (Math.abs(yA - yB) > 0.5) return yA - yB;
+      // If extremely close, fall back to x
+      if (Math.abs(xA - xB) > 0.5) return xA - xB;
+      return 0;
+    };
+  };
   const buildAncestorList = (n: BaseNode): any[] => {
     const list: any[] = [];
     let cur: any = n;
@@ -577,22 +616,11 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
       const mb = (typeof pb?.layoutMode === 'string') ? pb.layoutMode : 'NONE';
       const { ax: axA, ay: ayA } = getAbsXY(a);
       const { ax: axB, ay: ayB } = getAbsXY(b);
-      if (ma === 'VERTICAL' && mb === 'VERTICAL') {
-        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-      } else if (ma === 'HORIZONTAL' && mb === 'HORIZONTAL') {
-        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-      } else {
-        // If immediate parents do not both share axis, still use the scope's axis with absolute coords
-        if (scopeMode === 'VERTICAL') {
-          const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-          const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-        } else {
-          const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-          const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-        }
-      }
+      // Combined top-left score for axis priority
+      const sA = axA + ayA;
+      const sB = axB + ayB;
+      const ds = sA - sB;
+      if (Math.abs(ds) > 0.5) return ds;
       // 2) If axis order ties, prefer direct children (shallower depth from the specified scope)
       const da = depthFrom(scope, a);
       const db = depthFrom(scope, b);
@@ -663,8 +691,9 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     // 2) Fallback to absolute XY (top-left-first) when z-order is identical/ambiguous
     const { ax: axA, ay: ayA } = getAbsXY(a);
     const { ax: axB, ay: ayB } = getAbsXY(b);
-    const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-    const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
+    const sA = axA + ayA;
+    const sB = axB + ayB;
+    const ds = sA - sB; if (Math.abs(ds) > 0.5) return ds;
     return 0;
   };
   const compareVisual = (a: SceneNode, b: SceneNode): number => {
@@ -676,19 +705,13 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     if (pa && pa === pb && 'children' in pa) {
       const mode = (typeof pa.layoutMode === 'string') ? pa.layoutMode : 'NONE';
       const kids = pa.children as readonly BaseNode[];
-      if (mode === 'VERTICAL') {
+      if (mode === 'VERTICAL' || mode === 'HORIZONTAL') {
         const { ax: axA, ay: ayA } = getAbsXY(a);
         const { ax: axB, ay: ayB } = getAbsXY(b);
-        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-        // tie-breaker within same parent by paint order (frontmost-first)
-        return kids.indexOf(b) - kids.indexOf(a);
-      }
-      if (mode === 'HORIZONTAL') {
-        const { ax: axA, ay: ayA } = getAbsXY(a);
-        const { ax: axB, ay: ayB } = getAbsXY(b);
-        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
+        const sA = axA + ayA;
+        const sB = axB + ayB;
+        const ds = sA - sB;
+        if (Math.abs(ds) > 0.5) return ds; // top-left (smaller x+y) first
         // tie-breaker within same parent by paint order (frontmost-first)
         return kids.indexOf(b) - kids.indexOf(a);
       }
@@ -703,17 +726,10 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     if (axisMode !== 'NONE') {
       const { ax: axA, ay: ayA } = getAbsXY(a);
       const { ax: axB, ay: ayB } = getAbsXY(b);
-      if (axisMode === 'VERTICAL') {
-        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-      } else if (axisMode === 'HORIZONTAL') {
-        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-      } else {
-        // Mixed orientations: fall back to general visual top-left order
-        const dy = ayA - ayB; if (Math.abs(dy) > 0.5) return dy;
-        const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
-      }
+      const sA = axA + ayA;
+      const sB = axB + ayB;
+      const ds = sA - sB;
+      if (Math.abs(ds) > 0.5) return ds; // top-left first
       // fall through to LCA paint order tie-breaker
     }
 
@@ -870,7 +886,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             return true;
           });
           if (selMatches.length > 0) {
-            const sortedSel = selMatches.slice().sort(compareVisual);
+            const sortedSel = selMatches.slice().sort(buildRowComparator(selMatches));
             const pick = sortedSel[Math.max(0, indexToPickGlobal - 1)] || null;
             if (pick) {
               const sym = pick.type === 'SECTION' ? '$'
@@ -1175,7 +1191,20 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             // If the last specified scope is Auto Layout, apply scope-aware rules:
             const parentLayout = (typeof (parent as any)?.layoutMode === 'string') ? (parent as any).layoutMode : 'NONE';
             // Always prioritize XY first; use z-order as tie-breaker via scope-aware or general rules
-            const sorted = matches.slice().sort((x, y) => compareWithinScope(parent, x, y));
+            const rowCmp = buildRowComparator(matches);
+            const sorted = matches.slice().sort((x, y) => {
+              const scopeMode = (typeof (parent as any)?.layoutMode === 'string') ? (parent as any).layoutMode : 'NONE';
+              if (scopeMode === 'VERTICAL' || scopeMode === 'HORIZONTAL') {
+                // Row-major inside last Auto Layout scope
+                const r = rowCmp(x, y);
+                if (r !== 0) return r;
+                return compareWithinScope(parent, x, y);
+              }
+              // Non Auto Layout: keep Z-first behavior with row-major only as a secondary signal
+              const z = compareZFirstWithinScope(parent, x, y);
+              if (z !== 0) return z;
+              return rowCmp(x, y);
+            });
             const pick = sorted[indexToPick - 1] || null;
             if (pick) {
               const sym =
@@ -1242,7 +1271,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     const selectable = results
       .map(r => r.node)
       .filter(node => 'id' in node && node.type !== 'PAGE') as SceneNode[];
-    const sorted = selectable.slice().sort(compareVisual);
+    const sorted = selectable.slice().sort(buildRowComparator(selectable));
     const pick = sorted[Math.max(0, (modifiers!.indexPick as number) - 1)] || null;
     if (pick) {
       return results.filter(r => r.node === pick);
