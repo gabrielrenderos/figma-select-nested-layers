@@ -378,24 +378,24 @@ function getInitialScopes(excludeSelectedLayers: boolean = false): (SceneNode | 
   
   // Add all selected nodes and their valid ancestors
   for (const n of sel) {
-    // If excludeSelectedLayers is true, don't add the selected node itself
-    if (!excludeSelectedLayers) {
-      scopes.set(n.id, n);
-    }
+    // Always add selected nodes as scope roots; matching is skipped for scope nodes when using child search
+    scopes.set(n.id, n);
     
-    // Also add all valid ancestors of this selected node
-    let a: BaseNode | null = n;
-    while (
-      a && !(
-        a.type === 'PAGE' ||
-        a.type === 'SECTION' ||
-        a.type === 'FRAME' ||
-        a.type === 'INSTANCE' ||
-        a.type === 'COMPONENT' ||
-        a.type === 'COMPONENT_SET'
-      )
-    ) a = a.parent;
-    if (a && a.type !== 'PAGE') scopes.set((a as SceneNode).id, a as SceneNode);
+    // For non-child-only searches, also add valid ancestors as additional scopes
+    if (!excludeSelectedLayers) {
+      let a: BaseNode | null = n;
+      while (
+        a && !(
+          a.type === 'PAGE' ||
+          a.type === 'SECTION' ||
+          a.type === 'FRAME' ||
+          a.type === 'INSTANCE' ||
+          a.type === 'COMPONENT' ||
+          a.type === 'COMPONENT_SET'
+        )
+      ) a = a.parent;
+      if (a && a.type !== 'PAGE') scopes.set((a as SceneNode).id, a as SceneNode);
+    }
   }
   
   const out = Array.from(scopes.values());
@@ -928,7 +928,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             }
 
             if ('children' in s && s.children && s.children.length > 0) {
-              if (isChildSearch) {
+              if (isDirectChild) {
                 const children = (s as any).children as readonly SceneNode[];
                 for (const ch of children) {
                   if (SEARCH_CANCELLED) break;
