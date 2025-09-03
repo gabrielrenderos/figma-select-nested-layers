@@ -57,6 +57,8 @@ Add these at the end of your query:
 - `--fe` Stop at the first match in each specified scope.
 - `--h` Search hidden layers only.
 - `--a` Search all layers, including hidden and visible.
+- `--#` Pick the N‑th match overall in visual order (e.g. `--3`).
+- `--#e` Pick the N‑th match in each scope in visual order (e.g. `--2e`).
 
 You can combine modifiers, always using the double dash `--` before each one.
 
@@ -71,6 +73,12 @@ Finds the first matching "Button" inside "Card" frames.
 - `#Page/@Main Frame/!Logo --fe`
 Finds the first matching Page and switches to it, then finds all layers named "Main Frame", and inside of each of those layers, finds and selects the first matching instance "Logo".
 
+- `!Field --1`
+Selects the first matching instance of "Field" by rows (top→bottom, left→right) inside your current scope.
+
+- `@Container/@Form Section --3e`
+Looks for frames named "Container", then inside each container picks the 3rd "Form Section" by visible order.
+
 - `#Page/Cats and Dogs//& --a`
 Finds the first matching Page and switches to it, searches for all frames called "Cats and Dogs" (hidden and visible, of any type), then selects all images that are a direct children of the "Carts and Dogs" layers.
 
@@ -81,3 +89,24 @@ Finds the first matching Page and switches to it, searches for all frames called
 - Exact match is not supported (yet).
 - `/` (Slashes) in layer names will not be taken as part of the name, and cannot be searched directly.
 - Using `--h` (hidden only) or `--a` (all layers) will slow down the plugin search performance in big files. This happens because Figma materializes invisible children of instances when either modifier is used. That materialization is a document-level state that persists for the session and cannot be programmatically “unloaded” by plugins. The only way to fully clear it is to reload the file, or closing it and opening it back up.
+
+---
+
+# Index Modifiers
+
+Index selection lets you choose “which one” to select when there are multiple matches.
+
+- `--#` Global index
+  - Format: `--N` (for example, `--1`, `--2`, `--3`)
+  - Meaning: pick the N‑th match overall in your result list.
+  - Visual order: rows top→bottom, then left→right. Overlap does not change the index order regardless of which one is at the forefront.
+  - Example: `=Search --1` picks the first text layer named “Search” inside your scope.
+
+- `--#e` Per‑scope index (each scope gets its own N)
+  - Format: `--Ne` (for example, `--1e`, `--2e`, `--3e`)
+  - Meaning: for each scope in your query, pick the N‑th match within that scope.
+  - Best for nested queries like `@Card/Button --1e` (first “Button” inside each “Card”).
+
+**Tips**
+- Scopes come from your selection and from the nest you specify (e.g., `@Card/...`).
+- The index order is always based on visible reading order (rows top→bottom, then left→right).
