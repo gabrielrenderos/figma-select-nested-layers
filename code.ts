@@ -398,7 +398,18 @@ function getInitialScopes(excludeSelectedLayers: boolean = false): (SceneNode | 
     }
   }
   
-  const out = Array.from(scopes.values());
+  // Prune overlapping scopes: keep deepest nodes only (drop any scope that is an ancestor of another)
+  const all = Array.from(scopes.values());
+  const idSet = new Set(all.map(n => n.id));
+  const out = all.filter(n => {
+    let p: BaseNode | null = n.parent;
+    while (p && 'id' in p && (p as any).type !== 'PAGE') {
+      const pid = (p as any).id as string | undefined;
+      if (pid && idSet.has(pid)) return false; // ancestor present → drop this ancestor scope
+      p = (p as any).parent;
+    }
+    return true;
+  });
   
   // Return all scopes (no artificial limit to ensure all selected layers are searched)
   return out.length ? out : [figma.currentPage];
@@ -868,8 +879,116 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         const isChildSearch = query.trim().startsWith('/');
         const scopes = getInitialScopes(isChildSearch);
         const rootResults: SearchResult[] = [];
+        const pickedIdsRoot = new Set<string>();
 
         const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
+
+        // Minimal, safe global-rank handling for per-scope index on the final part at root
+        if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPickEach ?? null))) {
+          const gate = gateFor(searchType);
+          const qLower = searchName.toLowerCase();
+          type Scoped = { scope: SceneNode | PageNode | SectionNode; matches: SceneNode[] };
+          const scoped: Scoped[] = [];
+
+          // Collect matches per scope (respecting visibility and direct-child)
+          for (const s of scopes) {
+            if (SEARCH_CANCELLED) break;
+            const matches: SceneNode[] = [];
+            if (!isChildSearch) {
+              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && ((s.name || '').toLowerCase().indexOf(qLower) !== -1);
+              if (scopeMatches) {
+                const isVisible = (s as SceneNode).visible;
+                let includeScope = true;
+                if (modifiers?.hiddenOnly) includeScope = !isVisible;
+                else if (!modifiers?.allLayers) includeScope = isVisible;
+                if (includeScope) matches.push(s as SceneNode);
+              }
+            }
+            if ('children' in s && s.children && s.children.length > 0) {
+              if (isDirectChild) {
+                const children = (s as any).children as readonly SceneNode[];
+                for (const ch of children) {
+                  if (SEARCH_CANCELLED) break;
+                  if (!modifiers?.allLayers && !modifiers?.hiddenOnly && !ch.visible) continue;
+                  if (searchType === 'SHAPE' && gateImage(ch)) continue;
+                  if (searchType === 'IMAGE' && !gateImage(ch)) continue;
+                  if (!gate(ch)) continue;
+                  if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                  if (modifiers?.hiddenOnly && ch.visible) continue;
+                  matches.push(ch);
+                }
+              } else {
+                if (searchType === 'SECTION' || searchType === 'FRAME' || searchType === 'INSTANCE' || searchType === 'COMPONENT') {
+                  const types =
+                    searchType === 'SECTION'   ? ['SECTION'] :
+                    searchType === 'FRAME'     ? ['FRAME','GROUP'] :
+                    searchType === 'INSTANCE'  ? ['INSTANCE'] :
+                                                 ['COMPONENT','COMPONENT_SET'];
+                  const pool = getCachedTypePool(s as any, types, fastMode);
+                  for (const n of pool) {
+                    if (SEARCH_CANCELLED) break;
+                    if (fastMode && !n.visible) continue;
+                    if (((n.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                    let include = true;
+                    if (!fastMode) {
+                      const isVisible = n.visible;
+                      if (modifiers?.hiddenOnly) include = !isVisible;
+                      else if (modifiers?.allLayers) include = true;
+                      else include = isVisible;
+                    }
+                    if (include) matches.push(n);
+                  }
+                } else {
+                  const fast = !(modifiers?.hiddenOnly || modifiers?.allLayers);
+                  const pool = (s as any).findAll((n: SceneNode) => {
+                    if (fast && !n.visible) return false;
+                    if (searchType === 'SHAPE' && gateImage(n)) return false;
+                    if (searchType === 'IMAGE' && !gateImage(n)) return false;
+                    if (!gate(n)) return false;
+                    if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+                    if (modifiers?.hiddenOnly && n.visible) return false;
+                    return true;
+                  }) as SceneNode[];
+                  matches.push(...pool);
+                }
+              }
+            }
+            if (matches.length) scoped.push({ scope: s, matches });
+          }
+
+          // Build global visual rank across all matches
+          const idToNode = new Map<string, SceneNode>();
+          for (const sc of scoped) for (const m of sc.matches) idToNode.set(m.id, m);
+          const flat = Array.from(idToNode.values());
+          if (flat.length) {
+            const cmp = buildRowComparator(flat);
+            flat.sort(cmp);
+            const rank = new Map<string, number>();
+            for (let ri = 0; ri < flat.length; ri++) rank.set(flat[ri].id, ri);
+
+            const perScope: SearchResult[] = [];
+            const seen = new Set<string>();
+            const nPick = (modifiers?.indexPickEach ?? 1);
+            for (const sc of scoped) {
+              const sorted = sc.matches.slice().sort((a, b) => (rank.get(a.id)! - rank.get(b.id)!));
+              const pick = sorted[nPick - 1] || null;
+              if (pick && !seen.has(pick.id)) {
+                const sym = pick.type === 'SECTION' ? '$'
+                  : (pick.type === 'FRAME' || pick.type === 'GROUP') ? '@'
+                  : pick.type === 'INSTANCE' ? '!'
+                  : pick.type === 'TEXT' ? '='
+                  : (pick.type === 'COMPONENT' || pick.type === 'COMPONENT_SET') ? '?'
+                  : searchType === 'IMAGE' ? '&'
+                  : searchType === 'SHAPE' ? '%' : '';
+                perScope.push({ node: pick, path: `${getNodePath(sc.scope)}/${sym}${pick.name}` });
+                seen.add(pick.id);
+              }
+            }
+            results = perScope;
+            currentScope = perScope.map(r => r.node);
+            continue; // move to next part; skip default scanning
+          }
+        }
         // Special global-selection indexed pick: when selection contains leaf nodes that match the query,
         // pick Nth across the selection regardless of parent scopes.
         const selected = (figma.currentPage.selection as SceneNode[]) || [];
@@ -978,9 +1097,36 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             }
 
             if (matches.length) {
-              const sorted = matches.slice().sort(compareVisual);
-              const pick = sorted[indexToPick - 1] || null;
-              if (pick) {
+              // Build global owner map for this root-level scope set to avoid cross-scope duplicates
+              const scopeIds = new Set(scopes.map(ss => (ss as any).id as string));
+              const ownerOf = (n: SceneNode): string | null => {
+                const selfId = (n as any).id as string | undefined;
+                if (selfId && scopeIds.has(selfId)) return selfId; // node is itself a selected scope
+                let cur: any = n.parent;
+                while (cur) {
+                  const cid = cur.id as string | undefined;
+                  if (cid && scopeIds.has(cid)) return cid;
+                  cur = cur.parent;
+                }
+                return null;
+              };
+              const cmp = buildRowComparator(matches);
+              const sorted = matches.slice().sort(cmp);
+              const ranked = new Map<string, number>();
+              for (let ri = 0; ri < sorted.length; ri++) ranked.set(sorted[ri].id, ri);
+
+              // Attribute leaf nodes (shapes/images/text) selected raw to themselves as owner
+              const sid = ((s as any).id as string);
+              const mine = matches.filter(m => {
+                const own = ownerOf(m);
+                if (!own && (m.type === 'RECTANGLE' || m.type === 'ELLIPSE' || m.type === 'POLYGON' || m.type === 'STAR' || m.type === 'LINE' || m.type === 'VECTOR' || m.type === 'TEXT')) {
+                  return ((m as any).id as string) === sid;
+                }
+                return own === sid;
+              });
+              const mineSorted = mine.slice().sort((a,b)=> (ranked.get(a.id)! - ranked.get(b.id)!));
+              const pick = mineSorted[indexToPick - 1] || null;
+              if (pick && !pickedIdsRoot.has(pick.id)) {
                 const sym = pick.type === 'SECTION' ? '$'
                   : (pick.type === 'FRAME' || pick.type === 'GROUP') ? '@'
                   : pick.type === 'INSTANCE' ? '!'
@@ -989,7 +1135,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   : searchType === 'IMAGE' ? '&'
                   : searchType === 'SHAPE' ? '%' : '';
                 rootResults.push({ node: pick, path: `${getNodePath(s)}/${sym}${pick.name}` });
-                FOUND_ONE = true;
+                pickedIdsRoot.add(pick.id);
               }
             }
             // Done with per-scope first pick; continue to next scope
@@ -1648,7 +1794,7 @@ async function searchNodesRecursive(
           return false; // Stop searching this scope
         }
       }
-      return false;                        // still prune this node’s children
+      return false;                        // still prune this node's children
     }
     return true;
   }, modifiers, isFinalPart);
