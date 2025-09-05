@@ -156,9 +156,8 @@ interface SearchModifiers {
   hiddenOnly: boolean;
   allLayers: boolean;
   cleanQuery: string;
-  // --# (e.g., --3): global index selection across all matches (1-based)
+  // Index modifiers are parsed inline per part; globals are no longer parsed here
   indexPick?: number | null;
-  // --#e (e.g., --3e): per-scope index selection on the final part (1-based)
   indexPickEach?: number | null;
 }
 
@@ -191,28 +190,7 @@ function parseModifiers(query: string): SearchModifiers {
     modifiers.firstMatchEach = true;
     cleanQuery = cleanQuery.replace(/\s*--fe\s*/g, '').trim();
   }
-  // Extract --#e (numeric) per-scope index for the last part FIRST (so we don't consume the number as --#)
-  const idxEachPattern = /--(\d+)e/g;
-  let im: RegExpExecArray | null;
-  let lastIndexPickEach: number | null = null;
-  while ((im = idxEachPattern.exec(cleanQuery)) !== null) {
-    const num = parseInt(im[1], 10);
-    if (!Number.isNaN(num) && num >= 1) lastIndexPickEach = num;
-  }
-  if (lastIndexPickEach !== null) modifiers.indexPickEach = lastIndexPickEach;
-  // Remove all occurrences of --#e
-  cleanQuery = cleanQuery.replace(/\s*--\d+e\s*/g, ' ').trim();
-
-  // Extract --# (numeric) global index (e.g., --3). If multiple, the last wins.
-  const idxNumPattern = /--(\d+)/g;
-  let lastIndexPick: number | null = null;
-  while ((im = idxNumPattern.exec(cleanQuery)) !== null) {
-    const num = parseInt(im[1], 10);
-    if (!Number.isNaN(num) && num >= 1) lastIndexPick = num;
-  }
-  if (lastIndexPick !== null) modifiers.indexPick = lastIndexPick;
-  // Remove all occurrences of --#
-  cleanQuery = cleanQuery.replace(/\s*--\d+\s*/g, ' ').trim();
+  // Note: index modifiers (--# and --#e) are handled inline per part; do not strip here.
   
   const modifierPattern = /\s*--([fha])\s*/g;
   let match;
@@ -785,7 +763,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
   const segments = query.split('/');
   
   for (let i = 0; i < segments.length; i++) {
-    const segment = segments[i].trim();
+    let segment = segments[i].trim();
     if (segment.length === 0) continue;
     
     // Check if this segment is followed by an empty segment (indicating //)
@@ -808,15 +786,20 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
   }
 
   // If the query starts with //, mark the first real part as direct-child
-  if (/^\s*\/{2}/.test(trimmedQuery) && parts.length > 0) {
+  const startsWithDirect = /^\s*\/{2}/.test(trimmedQuery);
+  if (startsWithDirect && parts.length > 0) {
     parts[0].isDirectChild = true;
   }
 
   // Propagate the direct-child indicator to the following part (so it applies to the child search term)
   for (let i = parts.length - 2; i >= 0; i--) {
     if (parts[i].isDirectChild) {
-      parts[i + 1].isDirectChild = true;
-      parts[i].isDirectChild = false;
+      // Do not propagate the leading // from the very start of the query;
+      // it should only apply to the first part relative to the current selection.
+      if (!(startsWithDirect && i === 0)) {
+        parts[i + 1].isDirectChild = true;
+        parts[i].isDirectChild = false;
+      }
     }
   }
   
@@ -860,8 +843,17 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     const rawPart = part;
     const isRoot = i === 0;
 
-    const searchType = getSearchType(rawPart);
-    const searchName = getSearchName(rawPart);
+    // Extract inline index modifiers for this part
+    const inlineIdxEachMatch = rawPart.match(/--(\d+)e\b/);
+    const inlineIdxGlobalMatch = rawPart.match(/--(\d+)\b(?!e)/);
+    const inlineIdxEach = inlineIdxEachMatch ? parseInt(inlineIdxEachMatch[1], 10) : null;
+    const inlineIdxGlobal = inlineIdxGlobalMatch ? parseInt(inlineIdxGlobalMatch[1], 10) : null;
+
+    // Clean part from inline index modifiers for type/name parsing
+    const cleanedPart = rawPart.replace(/\s*--\d+e\b/g, '').replace(/\s*--\d+\b/g, '').trim();
+
+    const searchType = getSearchType(cleanedPart);
+    const searchName = getSearchName(cleanedPart);
 
     FOUND_ONE = false;
 
@@ -882,6 +874,54 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         const pickedIdsRoot = new Set<string>();
 
         const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
+
+        // Inline global index on this part: pick Nth overall and use it as the sole scope for next parts
+        if (inlineIdxGlobal !== null) {
+          const gate = gateFor(searchType);
+          const qLower = searchName.toLowerCase();
+          const all: SceneNode[] = [];
+          for (const s of scopes) {
+            if (SEARCH_CANCELLED) break;
+            if (!isChildSearch) {
+              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && ((s.name || '').toLowerCase().indexOf(qLower) !== -1);
+              if (scopeMatches) all.push(s as SceneNode);
+            }
+            if ('children' in s && s.children && s.children.length > 0) {
+              if (isDirectChild) {
+                const children = (s as any).children as readonly SceneNode[];
+                for (const ch of children) {
+                  if (SEARCH_CANCELLED) break;
+                  if (fastMode && !ch.visible) continue;
+                  if (searchType === 'SHAPE' && gateImage(ch)) continue;
+                  if (searchType === 'IMAGE' && !gateImage(ch)) continue;
+                  if (!gate(ch)) continue;
+                  if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                  all.push(ch);
+                }
+              } else {
+                const fast = !(modifiers?.hiddenOnly || modifiers?.allLayers);
+                const pool = (s as any).findAll((n: SceneNode) => {
+                  if (fast && !n.visible) return false;
+                  if (searchType === 'SHAPE' && gateImage(n)) return false;
+                  if (searchType === 'IMAGE' && !gateImage(n)) return false;
+                  if (!gate(n)) return false;
+                  if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+                  return true;
+                }) as SceneNode[];
+                all.push(...pool);
+              }
+            }
+          }
+          if (all.length) {
+            const sorted = all.slice().sort(buildRowComparator(all));
+            const pick = sorted[Math.max(0, inlineIdxGlobal - 1)] || null;
+            if (pick) {
+              results = [{ node: pick, path: getNodePath(pick) }];
+              currentScope = [pick];
+              continue;
+            }
+          }
+        }
 
         // Minimal, safe global-rank handling for per-scope index on the final part at root
         if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPickEach ?? null))) {
@@ -1027,11 +1067,11 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         for (const s of scopes) {
           if (SEARCH_CANCELLED) break;
           
-          // Per-scope pick for --fe (first in each scope) or --#e (Nth in each scope) on the last part.
-          if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPickEach ?? null))) {
+          // Per-scope pick for --fe (first in each scope) or inline --#e on this part
+          if (!modifiers?.firstMatch && ((modifiers?.firstMatchEach && isLastPart) || (inlineIdxEach !== null))) {
             const gate = gateFor(searchType);
             const qLower = searchName.toLowerCase();
-            const indexToPick = (modifiers?.indexPickEach ?? 1);
+            const indexToPick = (inlineIdxEach ?? 1);
 
             const matches: SceneNode[] = [];
             // Consider the scope node itself if it matches and allowed by flags
@@ -1292,13 +1332,13 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         currentScope = rootResults.map(r => r.node);
       }
     } else {
-      // Special handling for per-scope pick (--fe or --#e) on the final part.
-      if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPickEach ?? null))) {
+      // Special handling for per-scope pick (--fe or inline --#e) on this part when it is the final part
+      if (!modifiers?.firstMatch && ((modifiers?.firstMatchEach && isLastPart) || (inlineIdxEach !== null))) {
         const perScope: SearchResult[] = [];
         const gate = gateFor(searchType);
         const qLower = searchName.toLowerCase();
 
-        const indexToPick = (modifiers?.indexPickEach ?? 1);
+        const indexToPick = (inlineIdxEach ?? 1);
 
         for (const parent of currentScope) {
           if (SEARCH_CANCELLED) break;
@@ -1369,6 +1409,49 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         results = perScope;
         currentScope = perScope.map(r => r.node);
       } else {
+        // Inline global index on a non-root part: pick Nth overall across all current scopes and continue
+        if (inlineIdxGlobal !== null) {
+          const gate = gateFor(searchType);
+          const qLower = searchName.toLowerCase();
+          const all: SceneNode[] = [];
+          for (const parent of currentScope) {
+            if (SEARCH_CANCELLED) break;
+            if (isDirectChild) {
+              if ('children' in parent) {
+                const children = (parent as any).children as readonly SceneNode[];
+                for (const ch of children) {
+                  if (SEARCH_CANCELLED) break;
+                  if (!modifiers?.allLayers && !modifiers?.hiddenOnly && !ch.visible) continue;
+                  if (searchType === 'SHAPE' && gateImage(ch)) continue;
+                  if (searchType === 'IMAGE' && !gateImage(ch)) continue;
+                  if (!gate(ch)) continue;
+                  if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                  all.push(ch);
+                }
+              }
+            } else {
+              const fastModeLocal = !(modifiers?.hiddenOnly || modifiers?.allLayers);
+              const pool = (parent as any).findAll((n: SceneNode) => {
+                if (fastModeLocal && !n.visible) return false;
+                if (searchType === 'SHAPE' && gateImage(n)) return false;
+                if (searchType === 'IMAGE' && !gateImage(n)) return false;
+                if (!gate(n)) return false;
+                if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+                return true;
+              }) as SceneNode[];
+              all.push(...pool);
+            }
+          }
+          if (all.length) {
+            const sorted = all.slice().sort(buildRowComparator(all));
+            const pick = sorted[Math.max(0, inlineIdxGlobal - 1)] || null;
+            if (pick) {
+              results = [{ node: pick, path: `${getNodePath(pick)}` }];
+              currentScope = [pick];
+              continue;
+            }
+          }
+        }
         const childResults: SearchResult[] = [];
         for (const parent of currentScope) {
           if (SEARCH_CANCELLED) break;
