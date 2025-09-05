@@ -914,7 +914,8 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
           }
           if (all.length) {
             const sorted = all.slice().sort(buildRowComparator(all));
-            const pick = sorted[Math.max(0, inlineIdxGlobal - 1)] || null;
+            const idxG = (inlineIdxGlobal === 0 ? sorted.length : inlineIdxGlobal);
+            const pick = sorted[Math.max(0, idxG - 1)] || null;
             if (pick) {
               results = [{ node: pick, path: getNodePath(pick) }];
               currentScope = [pick];
@@ -1165,7 +1166,8 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 return own === sid;
               });
               const mineSorted = mine.slice().sort((a,b)=> (ranked.get(a.id)! - ranked.get(b.id)!));
-              const pick = mineSorted[indexToPick - 1] || null;
+              const idxE = (inlineIdxEach === 0 ? mineSorted.length : (inlineIdxEach ?? 1));
+              const pick = mineSorted[Math.max(0, idxE - 1)] || null;
               if (pick && !pickedIdsRoot.has(pick.id)) {
                 const sym = pick.type === 'SECTION' ? '$'
                   : (pick.type === 'FRAME' || pick.type === 'GROUP') ? '@'
@@ -1391,7 +1393,8 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               if (z !== 0) return z;
               return rowCmp(x, y);
             });
-            const pick = sorted[indexToPick - 1] || null;
+            const idxE2 = (indexToPick === 0 ? sorted.length : indexToPick);
+            const pick = sorted[Math.max(0, idxE2 - 1)] || null;
             if (pick) {
               const sym =
                 searchType === 'IMAGE' ? '&' :
@@ -1444,7 +1447,8 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
           }
           if (all.length) {
             const sorted = all.slice().sort(buildRowComparator(all));
-            const pick = sorted[Math.max(0, inlineIdxGlobal - 1)] || null;
+            const idxG = (inlineIdxGlobal === 0 ? sorted.length : inlineIdxGlobal);
+            const pick = sorted[Math.max(0, idxG - 1)] || null;
             if (pick) {
               results = [{ node: pick, path: `${getNodePath(pick)}` }];
               currentScope = [pick];
@@ -1501,7 +1505,8 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
       .map(r => r.node)
       .filter(node => 'id' in node && node.type !== 'PAGE') as SceneNode[];
     const sorted = selectable.slice().sort(buildRowComparator(selectable));
-    const pick = sorted[Math.max(0, (modifiers!.indexPick as number) - 1)] || null;
+    const idxG = ((modifiers!.indexPick as number) === 0 ? sorted.length : (modifiers!.indexPick as number));
+    const pick = sorted[Math.max(0, idxG - 1)] || null;
     if (pick) {
       return results.filter(r => r.node === pick);
     } else {
