@@ -48,6 +48,7 @@ Finds only direct children named "CTA" inside each frame called "Card".
 - Scope is defined by your current selection.
 - If nothing is selected, the current page is used as scope.
 - Every query starts fresh from that scope.
+- Leading `//` at the very start applies only to the first part relative to your selection. Later parts are not forced to be direct children unless you add `//` again next to that part.
 
 ---
 
@@ -59,6 +60,10 @@ Add these at the end of your query:
 - `--a` Search all layers, including hidden and visible.
 - `--#` Pick the N‑th match overall in visual order (e.g. `--3`).
 - `--#e` Pick the N‑th match in each scope in visual order (e.g. `--2e`).
+
+Inline index placement
+- You can place `--#` and `--#e` right next to the path part they apply to. Example: `@Dropdown List --1e/@Dropdown Option` picks the first list in each scope, then returns all options inside those lists.
+- `--0` and `--0e` mean “last” (global or per‑scope) for that part.
 
 You can combine modifiers, always using the double dash `--` before each one.
 
@@ -78,6 +83,9 @@ Selects the first matching instance of "Field" by rows (top→bottom, left→rig
 
 - `@Container/@Form Section --3e`
 Looks for frames named "Container", then inside each container picks the 3rd "Form Section" by visible order.
+
+- `@Dropdown List --0/@Dropdown Option`
+Picks the last dropdown list, then selects all options inside it.
 
 - `#Page/Cats and Dogs//& --a`
 Finds the first matching Page and switches to it, searches for all frames called "Cats and Dogs" (hidden and visible, of any type), then selects all images that are a direct children of the "Carts and Dogs" layers.
@@ -107,6 +115,14 @@ Index selection lets you choose “which one” to select when there are multipl
   - Meaning: for each scope in your query, pick the N‑th match within that scope.
   - Best for nested queries like `@Card/Button --1e` (first “Button” inside each “Card”).
 
+Inline placement
+- Place the index right next to the part it applies to: `@Table/@Row --1e/Cell`.
+- Global inline `--#` narrows to that one match and continues the query inside it.
+
+0 means “last”
+- `--0` picks the last match overall; `--0e` picks the last in each scope.
+
 **Tips**
 - Scopes come from your selection and from the nest you specify (e.g., `@Card/...`).
-- The index order is always based on visible reading order (rows top→bottom, then left→right).
+- The index order is always based on visible reading order (rows top→bottom, then 
+left→right).

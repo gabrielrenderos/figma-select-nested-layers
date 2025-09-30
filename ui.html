@@ -182,7 +182,7 @@
     </div>
     <div id="status" class="label" role="status" style="font-size: 11px; margin-bottom: 8px;">Use symbols to create advanced searches for selection.</div>
     <div style="display: none; font-size: 12px; color: #888; margin-top: 4px;">
-      Add "--f" to stop at first match, "--fe" for first match in each scope, "--h" for hidden only, "--a" for all layers, "--#" for global index (e.g. --3), or "--#e" for per-scope index on the last part (e.g. --2e).
+      Add "--f" to stop at first match, "--fe" for first match in each scope, "--h" for hidden only, "--a" for all layers, "--#" (e.g. --3 or --0) and "--#e" (e.g. --2e or --0e). Place index next to the part it applies to.
     </div>
 
     <div class="section-title">Layer Types</div>
@@ -248,12 +248,12 @@
 
       <div class="reference-group">
         <div class="reference-label">Modifiers:</div>
-        <div class="section-content" style="margin-bottom: 8px;">Add these modifiers <em>at the end of your query</em> to modify search behavior.</div>
+        <div class="section-content" style="margin-bottom: 8px;">Add these modifiers to modify search behavior. Index modifiers can be placed <em>inline</em> on the part they apply to.</div>
         <div class="reference-content">
           <div class="reference-item"><span class="code-inline">--f</span> Stop at first match found.</div>
           <div class="reference-item"><span class="code-inline">--fe</span> Stop at first match found in each scope.</div>
-          <div class="reference-item"><span class="code-inline">--#</span> Select the <em>#</em>-th match <em>overall</em> in visual order (e.g. <span class="code-inline">--3</span>). This is global across all matched layers, not per scope.</div>
-          <div class="reference-item"><span class="code-inline">--#e</span> Select the <em>#</em>-th match <em>in each scope</em> on the final part (e.g. <span class="code-inline">--2e</span> selects the 2nd in each matched parent scope).</div>
+          <div class="reference-item"><span class="code-inline">--#</span> Select the <em>#</em>-th match <em>overall</em> in visual order (e.g. <span class="code-inline">--3</span>, <span class="code-inline">--0</span> = last). Place it after a part to narrow to that one match and continue.</div>
+          <div class="reference-item"><span class="code-inline">--#e</span> Select the <em>#</em>-th match <em>in each scope</em> on that part (e.g. <span class="code-inline">--2e</span>, <span class="code-inline">--0e</span> = last in each scope).</div>
           <div class="reference-item"><span class="code-inline">--h</span> Search hidden layers only.</div>
           <div class="reference-item"><span class="code-inline">--a</span> Search all layers (hidden and visible).</div>
         </div>
