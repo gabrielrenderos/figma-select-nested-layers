@@ -1376,22 +1376,18 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
           }
 
           if (matches.length) {
-            // If the last specified scope is Auto Layout, apply scope-aware rules:
-            const parentLayout = (typeof (parent as any)?.layoutMode === 'string') ? (parent as any).layoutMode : 'NONE';
-            // Always prioritize XY first; use z-order as tie-breaker via scope-aware or general rules
+            // Always prioritize visual (XY) order; layer order only breaks ties
             const rowCmp = buildRowComparator(matches);
             const sorted = matches.slice().sort((x, y) => {
+              const r = rowCmp(x, y);
+              if (r !== 0) return r;
               const scopeMode = (typeof (parent as any)?.layoutMode === 'string') ? (parent as any).layoutMode : 'NONE';
               if (scopeMode === 'VERTICAL' || scopeMode === 'HORIZONTAL') {
-                // Row-major inside last Auto Layout scope
-                const r = rowCmp(x, y);
-                if (r !== 0) return r;
+                // Auto Layout scopes: keep axis-aware tie-breakers
                 return compareWithinScope(parent, x, y);
               }
-              // Non Auto Layout: keep Z-first behavior with row-major only as a secondary signal
-              const z = compareZFirstWithinScope(parent, x, y);
-              if (z !== 0) return z;
-              return rowCmp(x, y);
+              // Non Auto Layout: fall back to paint order only when positions tie
+              return compareZFirstWithinScope(parent, x, y);
             });
             const idxE2 = (indexToPick === 0 ? sorted.length : indexToPick);
             const pick = sorted[Math.max(0, idxE2 - 1)] || null;
