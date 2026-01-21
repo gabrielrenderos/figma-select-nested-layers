@@ -425,7 +425,7 @@ function tokenizeNameQuery(raw: string): NameToken[] {
         if (current.trim().length) pushToken(false);
         inQuote = true;
       }
-      continue;
+      continue; // do not include quote characters in the token
     }
     if (!inQuote && /\s/.test(ch)) {
       pushToken(false);
