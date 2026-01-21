@@ -460,7 +460,7 @@ function buildNameMatcher(q: string): (name: string) => boolean {
 
   const matcher = (name: string): boolean => {
     if (!hasTokens) return true;
-    if (exact) return name === quoted[0];
+    if (exact) return name.indexOf(quoted[0]) !== -1; // case-sensitive literal substring
 
     const lower = name.toLowerCase();
     for (const lit of quoted) {
@@ -1073,8 +1073,12 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                     searchType === 'FRAME'     ? ['FRAME','GROUP'] :
                     searchType === 'INSTANCE'  ? ['INSTANCE'] :
                                                  ['COMPONENT','COMPONENT_SET'];
-                  const pool = getCachedTypePool(s as any, types, fastMode);
-                  for (const n of pool) {
+                  // When a quoted literal is present, prefer name-aware traversal to avoid stale cached pools
+                  const hasQuoted = searchName.indexOf('"') !== -1;
+                  const pool = hasQuoted
+                    ? findMatchingDeep(s as any, searchType, searchName, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
+                    : getCachedTypePool(s as any, types, fastMode);
+                  for (const n of pool as any) {
                     if (SEARCH_CANCELLED) break;
                     if (fastMode && !n.visible) continue;
                     if (!nameMatches(n.name || '')) continue;
@@ -1085,7 +1089,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                       else if (modifiers?.allLayers) include = true;
                       else include = isVisible;
                     }
-                    if (include) matches.push(n);
+                    if (include) matches.push(n as any);
                   }
                 } else {
                   const fast = !(modifiers?.hiddenOnly || modifiers?.allLayers);
@@ -1213,8 +1217,11 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                     searchType === 'FRAME'     ? ['FRAME','GROUP'] :
                     searchType === 'INSTANCE'  ? ['INSTANCE'] :
                                                  ['COMPONENT','COMPONENT_SET'];
-                  const pool = getCachedTypePool(s as any, types, fastMode);
-                  for (const n of pool) {
+                  const hasQuoted = searchName.indexOf('"') !== -1;
+                  const pool = hasQuoted
+                    ? findMatchingDeep(s as any, searchType, searchName, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
+                    : getCachedTypePool(s as any, types, fastMode);
+                  for (const n of pool as any) {
                     if (SEARCH_CANCELLED) break;
                     if (fastMode && !n.visible) continue;
                     if (!nameMatches(n.name || '')) continue;
@@ -1350,16 +1357,18 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 searchType === 'INSTANCE'  ? ['INSTANCE'] :
                                              ['COMPONENT','COMPONENT_SET'];
 
-              // Use cached/uncached pool depending on mode
-              const pool = getCachedTypePool(s as any, types, fastMode);
+              // Use name-aware traversal when quoted to ensure literal matches; otherwise use cached pool
+              const hasQuoted = searchName.indexOf('"') !== -1;
+              const pool = hasQuoted
+                ? findMatchingDeep(s as any, searchType, searchName, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
+                : getCachedTypePool(s as any, types, fastMode);
 
-              const q = searchName.toLowerCase();
               const yieldEveryPool = getYieldEvery(modifiers);
               for (let idx = 0; idx < pool.length; idx++) {
                 const n = pool[idx];
                 if (SEARCH_CANCELLED) break;
                 if (fastMode && !n.visible) continue;
-                if ((n.name || '').toLowerCase().indexOf(q) !== -1) {
+                if (matchesName(n as SceneNode, searchName)) {
                   // Determine inclusion based on visibility and flags
                   let shouldInclude = true;
                   if (!fastMode) {
@@ -1717,7 +1726,8 @@ async function searchAtRoot(type: string, name: string, modifiers?: SearchModifi
  */
 async function searchInPage(page: PageNode, type: string, name: string, modifiers?: SearchModifiers): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
-  const q = name.toLowerCase();
+  const hasQuoted = name.indexOf('"') !== -1;
+  const nameMatchesFn = buildNameMatcher(name);
 
   if (type === 'SECTION' || type === 'FRAME' || type === 'INSTANCE' || type === 'COMPONENT') {
     const types =
@@ -1727,9 +1737,11 @@ async function searchInPage(page: PageNode, type: string, name: string, modifier
       /* COMPONENT */        ['COMPONENT','COMPONENT_SET'];
 
     const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-    const pool = getCachedTypePool(page as any, types, fastMode);
-    for (const n of pool) {
-      if ((n.name || '').toLowerCase().indexOf(q) !== -1) {
+    const pool = hasQuoted
+      ? findMatchingDeep(page as any, type, name, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
+      : getCachedTypePool(page as any, types, fastMode);
+    for (const n of pool as any) {
+      if (nameMatchesFn((n as SceneNode).name || '')) {
         // Respect visibility flags similar to other code paths
         let shouldInclude = false;
         const isVisible = n.visible;
@@ -1771,7 +1783,7 @@ async function searchInPage(page: PageNode, type: string, name: string, modifier
     if (type === 'SHAPE' && gateImage(n)) return true;
     if (type === 'IMAGE' && !gateImage(n)) return true;
 
-    if (gate(n) && ((n.name || '').toLowerCase().indexOf(q) !== -1)) {
+    if (gate(n) && nameMatchesFn(n.name || '')) {
       const sym =
         type === 'IMAGE' ? '&' :
         type === 'SHAPE' ? '%' :
@@ -1833,14 +1845,16 @@ async function searchChildren(parent: SceneNode|PageNode|SectionNode, type: stri
         type === 'INSTANCE'  ? ['INSTANCE'] :
                                ['COMPONENT','COMPONENT_SET'];
 
-      const pool = getCachedTypePool(parent as any, types, fastMode);
-      const q = name.toLowerCase();
+    const hasQuoted = name.indexOf('"') !== -1;
+    const pool = hasQuoted
+      ? findMatchingDeep(parent as any, type, name, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
+      : getCachedTypePool(parent as any, types, fastMode);
       const yieldEvery = getYieldEvery(modifiers);
-      for (let idx = 0; idx < pool.length; idx++) {
+    for (let idx = 0; idx < pool.length; idx++) {
         const n = pool[idx];
         if (SEARCH_CANCELLED) break;
         if (fastMode && !isEffectivelyVisible(n)) continue;
-        if ((n.name || '').toLowerCase().indexOf(q) !== -1) {
+      if (matchesName(n as SceneNode, name)) {
           // Determine inclusion based on visibility and flags
           let shouldInclude = true;
           if (!fastMode) {
