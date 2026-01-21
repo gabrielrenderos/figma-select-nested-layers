@@ -460,7 +460,7 @@ function buildNameMatcher(q: string): (name: string) => boolean {
 
   const matcher = (name: string): boolean => {
     if (!hasTokens) return true;
-    if (exact) return name.indexOf(quoted[0]) !== -1; // case-sensitive literal substring
+    if (exact) return name === quoted[0]; // fully quoted single token → exact, case-sensitive
 
     const lower = name.toLowerCase();
     for (const lit of quoted) {
