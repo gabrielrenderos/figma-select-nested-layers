@@ -49,6 +49,7 @@ Finds only direct children named "CTA" inside each frame called "Card".
 - If nothing is selected, the current page is used as scope.
 - Every query starts fresh from that scope.
 - Leading `//` at the very start applies only to the first part relative to your selection. Later parts are not forced to be direct children unless you add `//` again next to that part.
+- Slashes inside quoted text are treated as part of the name, not as scope separators (useful for names like `"Item /"`).
 
 ---
 
@@ -93,9 +94,10 @@ Finds the first matching Page and switches to it, searches for all frames called
 ---
 
 # Name Matching Considerations:
-- All searches are fuzzy by default (partial matches).
-- Exact match is not supported (yet).
-- `/` (Slashes) in layer names will not be taken as part of the name, and cannot be searched directly.
+- Unquoted text is fuzzy by default (case-insensitive partial match).
+- Quoted text is literal and case-sensitive; spaces and symbols inside quotes are matched exactly.
+- A fully quoted term is an exact full-name match (e.g. `"=Icon"` matches only a layer literally named `=Icon` of any type; `="Icon"` matches a text layer named exactly `Icon`).
+- Multiple tokens are ANDed together. Quoted tokens keep slashes `/` as part of the name instead of splitting scope (e.g. `!Menu "Item /" =Icon` requires an instance name containing `Menu`, the literal `Item /`, and `=Icon`).
 - Using `--h` (hidden only) or `--a` (all layers) will slow down the plugin search performance in big files. This happens because Figma materializes invisible children of instances when either modifier is used. That materialization is a document-level state that persists for the session and cannot be programmatically “unloaded” by plugins. The only way to fully clear it is to reload the file, or closing it and opening it back up.
 
 ---

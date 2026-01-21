@@ -25,6 +25,7 @@ let SEARCH_CANCELLED = false; // Allow cancelling long searches
 // Performance optimization: cache search results for heavy files
 const searchCache = new Map<string, SearchResult[]>();
 const nodeCache = new Map<string, SceneNode[]>();
+const nameMatcherCache = new Map<string, (name: string) => boolean>();
 
 // Cooperative yielding to keep UI responsive during heavy searches.
 // We explicitly yield inside long loops and large batches to allow the cancel button
@@ -67,15 +68,16 @@ function getCachedTypePool(
 function findMatchingDeep(
   root: ChildrenMixin,
   type: string,
-  nameLower: string,
+  nameQuery: string,
   includeHidden: boolean = false
 ): readonly SceneNode[] {
   const gate = gateFor(type);
+  const nameMatches = buildNameMatcher(nameQuery);
   return (root as any).findAll((n: SceneNode) => {
     if (!includeHidden && !isEffectivelyVisible(n)) return false;
     if (type === 'SHAPE' && gateImage(n)) return false;
     if (type === 'IMAGE' && !gateImage(n)) return false;
-    return gate(n) && ((n.name || '').toLowerCase().indexOf(nameLower) !== -1);
+    return gate(n) && nameMatches(n.name || '');
   }) as readonly SceneNode[];
 }
 
@@ -248,6 +250,7 @@ figma.ui.onmessage = async (msg: { type: string; query?: string }) => {
         try { figma.skipInvisibleInstanceChildren = originalSkipInvisible; } catch {}
         try { searchCache.clear(); } catch {}
         try { nodeCache.clear(); } catch {}
+        try { nameMatcherCache.clear(); } catch {}
         STOP_ON_FIRST = false;
         FOUND_ONE = false;
         SEARCH_CANCELLED = false;
@@ -256,9 +259,10 @@ figma.ui.onmessage = async (msg: { type: string; query?: string }) => {
       // Detect leading "#Page ..." and switch pages first
       const m = q.match(/^\s*#([^/]+)/);
       if (m) {
-        const targetName = m[1].trim().toLowerCase();
+        const pageQuery = m[1].trim();
+        const pageNameMatches = buildNameMatcher(pageQuery);
         const target = figma.root.children.find(
-          p => p.type === 'PAGE' && p.name.toLowerCase().indexOf(targetName) !== -1
+          p => p.type === 'PAGE' && pageNameMatches(p.name)
         );
         if (target) {
           await figma.setCurrentPageAsync(target as PageNode);
@@ -394,16 +398,93 @@ function getInitialScopes(excludeSelectedLayers: boolean = false): (SceneNode | 
 }
 
 /**
- * Checks if a node's name matches the search query
- * Performs case-insensitive substring matching
+ * Tokenizes a name query, respecting quoted segments.
+ * Quoted tokens are matched literally and case-sensitively.
+ * Unquoted tokens use case-insensitive substring matching.
+ */
+type NameToken = { value: string; quoted: boolean };
+
+function tokenizeNameQuery(raw: string): NameToken[] {
+  const tokens: NameToken[] = [];
+  let current = '';
+  let inQuote = false;
+
+  const pushToken = (quoted: boolean) => {
+    const value = quoted ? current : current.trim();
+    if (value.length) tokens.push({ value, quoted });
+    current = '';
+  };
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === '"') {
+      if (inQuote) {
+        pushToken(true);
+        inQuote = false;
+      } else {
+        if (current.trim().length) pushToken(false);
+        inQuote = true;
+      }
+      continue;
+    }
+    if (!inQuote && /\s/.test(ch)) {
+      pushToken(false);
+      continue;
+    }
+    current += ch;
+  }
+
+  if (current.length) pushToken(inQuote);
+  return tokens;
+}
+
+function isFullyQuoted(raw: string): boolean {
+  const trimmed = raw.trim();
+  return trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2;
+}
+
+/**
+ * Builds a reusable matcher for a name query. Results are cached per query string.
+ * - Quoted tokens: literal, case-sensitive substring.
+ * - Unquoted tokens: case-insensitive substring.
+ * - A single fully quoted token matches the entire name (exact match).
+ */
+function buildNameMatcher(q: string): (name: string) => boolean {
+  if (nameMatcherCache.has(q)) return nameMatcherCache.get(q)!;
+
+  const tokens = tokenizeNameQuery(q);
+  const hasTokens = tokens.length > 0;
+  const exact = tokens.length === 1 && tokens[0].quoted && isFullyQuoted(q);
+  const quoted = tokens.filter(t => t.quoted).map(t => t.value);
+  const unquoted = tokens.filter(t => !t.quoted).map(t => t.value.toLowerCase());
+
+  const matcher = (name: string): boolean => {
+    if (!hasTokens) return true;
+    if (exact) return name === quoted[0];
+
+    const lower = name.toLowerCase();
+    for (const lit of quoted) {
+      if (!name.includes(lit)) return false;
+    }
+    for (const part of unquoted) {
+      if (lower.indexOf(part) === -1) return false;
+    }
+    return true;
+  };
+
+  nameMatcherCache.set(q, matcher);
+  return matcher;
+}
+
+/**
+ * Checks if a node's name matches the search query using the cached matcher.
  * @param n - The node to check
  * @param q - The search query
- * @returns true if the node name contains the query (or if query is empty)
+ * @returns true if the node name matches the query (or if query is empty)
  */
 function matchesName(n: SceneNode, q: string): boolean {
-  const nm = (n.name || '').toLowerCase();
-  const qq = q.toLowerCase();
-  return qq ? nm.indexOf(qq) !== -1 : true; // Empty query matches everything
+  const matcher = buildNameMatcher(q);
+  return matcher(n.name || '');
 }
 
 // Type filtering functions - determine if a node matches a specific search type
@@ -758,9 +839,37 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
     const dx = axA - axB; if (Math.abs(dx) > 0.5) return dx;
     return 0;
   };
-  // Parse query parts, handling // as a special separator for direct children
+  // Parse query parts, handling // as a special separator for direct children and
+  // keeping slashes inside quoted literals intact.
+  const splitQueryRespectingQuotes = (q: string): string[] => {
+    const segments: string[] = [];
+    let current = '';
+    let inQuote = false;
+
+    for (let i = 0; i < q.length; i++) {
+      const ch = q[i];
+      if (ch === '"') {
+        inQuote = !inQuote;
+        current += ch;
+        continue;
+      }
+      if (!inQuote && ch === '/') {
+        segments.push(current);
+        current = '';
+        if (i + 1 < q.length && q[i + 1] === '/') {
+          segments.push('');
+          i++;
+        }
+        continue;
+      }
+      current += ch;
+    }
+    segments.push(current);
+    return segments;
+  };
+
   const parts: { part: string; isDirectChild: boolean }[] = [];
-  const segments = query.split('/');
+  const segments = splitQueryRespectingQuotes(query);
   
   for (let i = 0; i < segments.length; i++) {
     let segment = segments[i].trim();
@@ -814,9 +923,10 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
 
   // Fast path for simple page searches (e.g., "#PageName")
   if (query.trim().startsWith('#') && !query.includes('/')) {
-    const pageName = query.trim().substring(1).toLowerCase();
+    const pageNameRaw = query.trim().substring(1);
+    const pageNameMatches = buildNameMatcher(pageNameRaw);
     const target = figma.root.children.find(p => 
-      p.type === 'PAGE' && p.name.toLowerCase().indexOf(pageName) !== -1
+      p.type === 'PAGE' && pageNameMatches(p.name)
     );
     if (target) {
       const result = [{ node: target, path: `#${target.name}` }];
@@ -854,6 +964,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
 
     const searchType = getSearchType(cleanedPart);
     const searchName = getSearchName(cleanedPart);
+    const nameMatches = buildNameMatcher(searchName);
 
     FOUND_ONE = false;
 
@@ -861,8 +972,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
       if (searchType === 'PAGE') {
         // Page search should have been handled by the fast path above
         // This is just a fallback for complex queries
-        const nameLower = searchName.toLowerCase();
-        const target = figma.root.children.find(p => p.name.toLowerCase().indexOf(nameLower) !== -1);
+        const target = figma.root.children.find(p => nameMatches(p.name));
         if (!target) { results = []; currentScope = []; break; }
         results = [{ node: target, path: `#${target.name}` }];
         currentScope = [target];
@@ -878,12 +988,11 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         // Inline global index on this part: pick Nth overall and use it as the sole scope for next parts
         if (inlineIdxGlobal !== null) {
           const gate = gateFor(searchType);
-          const qLower = searchName.toLowerCase();
           const all: SceneNode[] = [];
           for (const s of scopes) {
             if (SEARCH_CANCELLED) break;
             if (!isChildSearch) {
-              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && ((s.name || '').toLowerCase().indexOf(qLower) !== -1);
+              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && nameMatches(s.name || '');
               if (scopeMatches) all.push(s as SceneNode);
             }
             if ('children' in s && s.children && s.children.length > 0) {
@@ -895,7 +1004,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   if (searchType === 'SHAPE' && gateImage(ch)) continue;
                   if (searchType === 'IMAGE' && !gateImage(ch)) continue;
                   if (!gate(ch)) continue;
-                  if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                  if (!nameMatches(ch.name || '')) continue;
                   all.push(ch);
                 }
               } else {
@@ -905,7 +1014,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   if (searchType === 'SHAPE' && gateImage(n)) return false;
                   if (searchType === 'IMAGE' && !gateImage(n)) return false;
                   if (!gate(n)) return false;
-                  if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+                  if (!nameMatches(n.name || '')) return false;
                   return true;
                 }) as SceneNode[];
                 all.push(...pool);
@@ -927,7 +1036,6 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         // Minimal, safe global-rank handling for per-scope index on the final part at root
         if (isLastPart && !modifiers?.firstMatch && (modifiers?.firstMatchEach || (modifiers?.indexPickEach ?? null))) {
           const gate = gateFor(searchType);
-          const qLower = searchName.toLowerCase();
           type Scoped = { scope: SceneNode | PageNode | SectionNode; matches: SceneNode[] };
           const scoped: Scoped[] = [];
 
@@ -936,7 +1044,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             if (SEARCH_CANCELLED) break;
             const matches: SceneNode[] = [];
             if (!isChildSearch) {
-              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && ((s.name || '').toLowerCase().indexOf(qLower) !== -1);
+              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && nameMatches(s.name || '');
               if (scopeMatches) {
                 const isVisible = (s as SceneNode).visible;
                 let includeScope = true;
@@ -954,7 +1062,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   if (searchType === 'SHAPE' && gateImage(ch)) continue;
                   if (searchType === 'IMAGE' && !gateImage(ch)) continue;
                   if (!gate(ch)) continue;
-                  if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                  if (!nameMatches(ch.name || '')) continue;
                   if (modifiers?.hiddenOnly && ch.visible) continue;
                   matches.push(ch);
                 }
@@ -969,7 +1077,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   for (const n of pool) {
                     if (SEARCH_CANCELLED) break;
                     if (fastMode && !n.visible) continue;
-                    if (((n.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                    if (!nameMatches(n.name || '')) continue;
                     let include = true;
                     if (!fastMode) {
                       const isVisible = n.visible;
@@ -986,7 +1094,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                     if (searchType === 'SHAPE' && gateImage(n)) return false;
                     if (searchType === 'IMAGE' && !gateImage(n)) return false;
                     if (!gate(n)) return false;
-                    if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+                    if (!nameMatches(n.name || '')) return false;
                     if (modifiers?.hiddenOnly && n.visible) return false;
                     return true;
                   }) as SceneNode[];
@@ -1036,11 +1144,10 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         const indexToPickGlobal = (modifiers?.indexPick ?? null);
         if (isLastPart && !modifiers?.firstMatch && !isChildSearch && indexToPickGlobal) {
           const gate = gateFor(searchType);
-          const qLower = searchName.toLowerCase();
           const selMatches = selected.filter(ch => {
             // consider only leaf-like or directly matched nodes; visibility flags apply
             if (!gate(ch)) return false;
-            if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) return false;
+            if (!nameMatches(ch.name || '')) return false;
             if (modifiers?.hiddenOnly && ch.visible) return false;
             if (!modifiers?.allLayers && !modifiers?.hiddenOnly && !ch.visible) return false;
             return true;
@@ -1071,13 +1178,12 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
           // Per-scope pick for --fe (first in each scope) or inline --#e on this part
           if (!modifiers?.firstMatch && ((modifiers?.firstMatchEach && isLastPart) || (inlineIdxEach !== null))) {
             const gate = gateFor(searchType);
-            const qLower = searchName.toLowerCase();
             const indexToPick = (inlineIdxEach ?? 1);
 
             const matches: SceneNode[] = [];
             // Consider the scope node itself if it matches and allowed by flags
             if (!isChildSearch) {
-              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && ((s.name || '').toLowerCase().indexOf(qLower) !== -1);
+              const scopeMatches = s.type !== 'PAGE' && gate(s as SceneNode) && nameMatches(s.name || '');
               if (scopeMatches) {
                 const isVisible = (s as SceneNode).visible;
                 let includeScope = true;
@@ -1096,7 +1202,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   if (searchType === 'SHAPE' && gateImage(ch)) continue;
                   if (searchType === 'IMAGE' && !gateImage(ch)) continue;
                   if (!gate(ch)) continue;
-                  if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                    if (!nameMatches(ch.name || '')) continue;
                   if (modifiers?.hiddenOnly && ch.visible) continue;
                   matches.push(ch);
                 }
@@ -1111,7 +1217,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   for (const n of pool) {
                     if (SEARCH_CANCELLED) break;
                     if (fastMode && !n.visible) continue;
-                    if (((n.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                    if (!nameMatches(n.name || '')) continue;
                     let include = true;
                     if (!fastMode) {
                       const isVisible = n.visible;
@@ -1128,7 +1234,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                     if (searchType === 'SHAPE' && gateImage(n)) return false;
                     if (searchType === 'IMAGE' && !gateImage(n)) return false;
                     if (!gate(n)) return false;
-                    if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+                    if (!nameMatches(n.name || '')) return false;
                     if (modifiers?.hiddenOnly && n.visible) return false;
                     return true;
                   }) as SceneNode[];
@@ -1288,7 +1394,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             } else {
               if (fastMode) {
                 // Use the built-in fast deep finder in fast mode
-                const pool = findMatchingDeep(s as any, searchType, searchName.toLowerCase(), !!(modifiers?.hiddenOnly || modifiers?.allLayers));
+                const pool = findMatchingDeep(s as any, searchType, searchName, !!(modifiers?.hiddenOnly || modifiers?.allLayers));
                 const yieldEveryDeep = getYieldEvery(modifiers);
                 for (let idx = 0; idx < pool.length; idx++) {
                   const n = pool[idx];
@@ -1338,7 +1444,6 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
       if (!modifiers?.firstMatch && ((modifiers?.firstMatchEach && isLastPart) || (inlineIdxEach !== null))) {
         const perScope: SearchResult[] = [];
         const gate = gateFor(searchType);
-        const qLower = searchName.toLowerCase();
 
         const indexToPick = (inlineIdxEach ?? 1);
 
@@ -1355,7 +1460,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 if (searchType === 'SHAPE' && gateImage(ch)) continue;
                 if (searchType === 'IMAGE' && !gateImage(ch)) continue;
                 if (!gate(ch)) continue;
-                if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                if (!nameMatches(ch.name || '')) continue;
                 if (modifiers?.hiddenOnly && ch.visible) continue;
                 matches.push(ch);
               }
@@ -1368,7 +1473,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               if (searchType === 'SHAPE' && gateImage(n)) return false;
               if (searchType === 'IMAGE' && !gateImage(n)) return false;
               if (!gate(n)) return false;
-              if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+              if (!nameMatches(n.name || '')) return false;
               if (modifiers?.hiddenOnly && n.visible) return false;
               return true;
             }) as SceneNode[];
@@ -1411,7 +1516,6 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         // Inline global index on a non-root part: pick Nth overall across all current scopes and continue
         if (inlineIdxGlobal !== null) {
           const gate = gateFor(searchType);
-          const qLower = searchName.toLowerCase();
           const all: SceneNode[] = [];
           for (const parent of currentScope) {
             if (SEARCH_CANCELLED) break;
@@ -1424,7 +1528,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   if (searchType === 'SHAPE' && gateImage(ch)) continue;
                   if (searchType === 'IMAGE' && !gateImage(ch)) continue;
                   if (!gate(ch)) continue;
-                  if (((ch.name || '').toLowerCase().indexOf(qLower)) === -1) continue;
+                  if (!nameMatches(ch.name || '')) continue;
                   all.push(ch);
                 }
               }
@@ -1435,7 +1539,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 if (searchType === 'SHAPE' && gateImage(n)) return false;
                 if (searchType === 'IMAGE' && !gateImage(n)) return false;
                 if (!gate(n)) return false;
-                if (((n.name || '').toLowerCase().indexOf(qLower) === -1)) return false;
+                if (!nameMatches(n.name || '')) return false;
                 return true;
               }) as SceneNode[];
               all.push(...pool);
@@ -1574,13 +1678,13 @@ function getSearchName(part: string): string {
  */
 async function searchAtRoot(type: string, name: string, modifiers?: SearchModifiers): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
-  const nameLower = name.toLowerCase();
+  const nameMatches = buildNameMatcher(name);
   
   if (type === 'PAGE') {
     // Search through all pages in the document
     const pages = figma.root.children;
     for (const page of pages) {
-      if (page.name.toLowerCase().includes(nameLower)) {
+      if (nameMatches(page.name)) {
         results.push({ node: page, path: `#${page.name}` });
       }
     }
@@ -1589,7 +1693,7 @@ async function searchAtRoot(type: string, name: string, modifiers?: SearchModifi
     const currentPage = figma.currentPage;
     
     for (const child of currentPage.children) {
-      if (child.type === 'SECTION' && child.name.toLowerCase().includes(nameLower)) {
+      if (child.type === 'SECTION' && nameMatches(child.name)) {
         results.push({ node: child, path: `#${currentPage.name}/${child.name}` });
       }
     }
