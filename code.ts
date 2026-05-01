@@ -2,7 +2,78 @@
 // Allows searching through layers using a special syntax with symbols:
 // # = Page, $ = Section, @ = Frame, ! = Instance, ? = Component, & = Image, % = Shape, = = Text
 
-figma.showUI(__html__, { width: 380, height: 320, themeColors: true });
+// On-open positioning: horizontally center the plugin across the entire Figma window
+// and place its bottom MODAL_BOTTOM_OFFSET pixels above the bottom of the window
+// (clearing Figma's floating bottom toolbar).
+//
+// The plugin sandbox does not expose the Figma window dimensions directly, so the flow
+// is split between this file and ui.html:
+//   1. showUI({ visible: false, position: top-left of canvas pane }). At that position
+//      the iframe doesn't get clamped, so getPosition().windowSpace gives us the
+//      left/top chrome (sidebar + topbar) widths in pixels.
+//   2. ui.html posts 'window-dims' on script start with window.outerWidth / outerHeight
+//      (= the full Figma window size in Electron).
+//   3. We compute the target in window-pixel space, convert back to canvas-space using
+//      the chrome offsets, reposition(), and show().
+const PLUGIN_W = 380;
+const PLUGIN_H = 320;
+const MODAL_BOTTOM_OFFSET = 150;
+
+const initialBounds = figma.viewport.bounds;
+const initialZoom = figma.viewport.zoom || 1;
+
+figma.showUI(__html__, {
+  width: PLUGIN_W,
+  height: PLUGIN_H,
+  themeColors: true,
+  visible: false,
+  position: { x: initialBounds.x, y: initialBounds.y },
+});
+
+let leftChromePx = 0;
+let topChromePx = 0;
+try {
+  const p = figma.ui.getPosition();
+  leftChromePx = p.windowSpace.x;
+  topChromePx = p.windowSpace.y;
+} catch {}
+
+let positioned = false;
+function applyCenteringFromUiDims(winW: number, winH: number): void {
+  if (positioned) return;
+  positioned = true;
+
+  const canvasPaneWidthPx  = initialBounds.width  * initialZoom;
+  const canvasPaneHeightPx = initialBounds.height * initialZoom;
+
+  // If outerWidth/outerHeight are unreliable (unanticipated host), fall back to
+  // centering within the canvas pane.
+  const dimsLookSane =
+    winW > 0 && winH > 0 &&
+    winW < 100000 && winH < 100000 &&
+    winW >= leftChromePx + canvasPaneWidthPx  - 1 &&
+    winH >= topChromePx  + canvasPaneHeightPx - 1;
+
+  let targetCanvasX: number;
+  let targetCanvasY: number;
+
+  if (dimsLookSane) {
+    const targetWinX = Math.round((winW - PLUGIN_W) / 2);
+    const targetWinY = Math.round(winH - MODAL_BOTTOM_OFFSET - PLUGIN_H);
+    targetCanvasX = initialBounds.x + (targetWinX - leftChromePx) / initialZoom;
+    targetCanvasY = initialBounds.y + (targetWinY - topChromePx)  / initialZoom;
+  } else {
+    targetCanvasX = initialBounds.x + (initialBounds.width  - PLUGIN_W / initialZoom) / 2;
+    targetCanvasY = initialBounds.y +  initialBounds.height - (PLUGIN_H + MODAL_BOTTOM_OFFSET) / initialZoom;
+  }
+
+  try { figma.ui.reposition(targetCanvasX, targetCanvasY); } catch {}
+  try { figma.ui.show(); } catch {}
+}
+
+// Safety net: if 'window-dims' never arrives, use the fallback so the plugin doesn't
+// stay invisible.
+setTimeout(() => { if (!positioned) applyCenteringFromUiDims(0, 0); }, 250);
 
 // Performance optimization: skip invisible instance children for better performance
 figma.skipInvisibleInstanceChildren = true;
@@ -219,7 +290,7 @@ function parseModifiers(query: string): SearchModifiers {
   return modifiers;
 }
 
-figma.ui.onmessage = async (msg: { type: string; query?: string }) => {
+figma.ui.onmessage = async (msg: { type: string; query?: string; outerWidth?: number; outerHeight?: number }) => {
   if (msg.type === 'search' && msg.query) {
     let originalSkipInvisible = figma.skipInvisibleInstanceChildren;
     try {
@@ -331,6 +402,10 @@ figma.ui.onmessage = async (msg: { type: string; query?: string }) => {
       await figma.clientStorage.setAsync(LAST_QUERY_KEY, msg.query ?? '');
       cachedLastQuery = msg.query ?? '';
     } catch {}
+  } else if (msg.type === 'window-dims') {
+    const w = typeof msg.outerWidth  === 'number' ? msg.outerWidth  : 0;
+    const h = typeof msg.outerHeight === 'number' ? msg.outerHeight : 0;
+    applyCenteringFromUiDims(w, h);
   } else if (msg.type === 'uiReady') {
     // UI is ready: send back the last saved query (if any)
     if (cachedLastQuery) {

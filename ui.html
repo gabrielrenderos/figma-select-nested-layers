@@ -282,6 +282,15 @@
     const cancelBtn=document.getElementById('cancel');
     const clearBtn=document.getElementById('clear-selection');
 
+    // Send the Figma window dimensions to the plugin so it can center the modal and
+    // reposition+show the (still-invisible) iframe. In Figma desktop (Electron),
+    // window.outerWidth/outerHeight equal the full BrowserWindow size.
+    parent.postMessage({ pluginMessage: {
+      type: 'window-dims',
+      outerWidth: window.outerWidth,
+      outerHeight: window.outerHeight,
+    } }, '*');
+
     // Focus the input when the plugin loads and request last query (no artificial delay)
     requestAnimationFrame(() => {
       parent.postMessage({ pluginMessage: { type: 'uiReady' } }, '*');
