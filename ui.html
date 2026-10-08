@@ -3,6 +3,18 @@
 <head>
   <meta charset="utf-8" />
 
+  <script>
+    // Send the Figma window dimensions to the plugin as early as possible, before the
+    // rest of the page is parsed, so it can center the modal and reposition+show the
+    // (still-invisible) iframe. In Figma desktop (Electron), window.outerWidth/outerHeight
+    // equal the full BrowserWindow size.
+    parent.postMessage({ pluginMessage: {
+      type: 'window-dims',
+      outerWidth: window.outerWidth,
+      outerHeight: window.outerHeight,
+    } }, '*');
+  </script>
+
   <style>
     /* Base styles */
     :root { 
@@ -281,15 +293,6 @@
     const runBtn=document.getElementById('run');
     const cancelBtn=document.getElementById('cancel');
     const clearBtn=document.getElementById('clear-selection');
-
-    // Send the Figma window dimensions to the plugin so it can center the modal and
-    // reposition+show the (still-invisible) iframe. In Figma desktop (Electron),
-    // window.outerWidth/outerHeight equal the full BrowserWindow size.
-    parent.postMessage({ pluginMessage: {
-      type: 'window-dims',
-      outerWidth: window.outerWidth,
-      outerHeight: window.outerHeight,
-    } }, '*');
 
     // Focus the input when the plugin loads and request last query (no artificial delay)
     requestAnimationFrame(() => {
