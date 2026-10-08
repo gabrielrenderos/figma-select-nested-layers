@@ -11,8 +11,8 @@
 //   1. showUI({ visible: false, position: top-left of canvas pane }). At that position
 //      the iframe doesn't get clamped, so getPosition().windowSpace gives us the
 //      left/top chrome (sidebar + topbar) widths in pixels.
-//   2. ui.html posts 'window-dims' on script start with window.outerWidth / outerHeight
-//      (= the full Figma window size in Electron).
+//   2. ui.html posts 'window-dims' from the top of its <head>, before the rest of the page
+//      is parsed, with window.outerWidth / outerHeight (= the full Figma window size in Electron).
 //   3. We compute the target in window-pixel space, convert back to canvas-space using
 //      the chrome offsets, reposition(), and show().
 const PLUGIN_W = 380;
@@ -99,25 +99,71 @@ const nodeCache = new Map<string, SceneNode[]>();
 const nameMatcherCache = new Map<string, (name: string) => boolean>();
 
 // Cooperative yielding to keep UI responsive during heavy searches.
-// We explicitly yield inside long loops and large batches to allow the cancel button
-// and UI updates to process; the cadence is tighter when flags that include hidden
-// content are active because those traversals are much heavier.
-const YIELD_INTERVAL = 300; // default yield cadence
+// Long loops call shouldYield() and only hand control back once YIELD_AFTER_MS of work
+// has passed, so the cancel button and UI updates still process without paying the
+// cost of a timer round-trip every few hundred nodes.
+const YIELD_AFTER_MS = 30;
+let lastYieldAt = Date.now();
+function shouldYield(): boolean {
+  return Date.now() - lastYieldAt >= YIELD_AFTER_MS;
+}
 function yieldControl(): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, 0));
+  return new Promise(resolve => setTimeout(() => { lastYieldAt = Date.now(); resolve(); }, 0));
 }
 
-function getYieldEvery(modifiers?: SearchModifiers): number {
-  return (modifiers?.hiddenOnly || modifiers?.allLayers) ? 50 : YIELD_INTERVAL;
+// Node types each typed search maps to. Figma filters these natively through
+// findAllWithCriteria, which is much faster than visiting every node with findAll.
+const FRAME_TYPES: NodeType[] = ['FRAME', 'GROUP', 'SLOT', 'TRANSFORM_GROUP'];
+const TEXT_TYPES: NodeType[] = ['TEXT', 'TEXT_PATH'];
+const SHAPE_TYPES: NodeType[] = ['RECTANGLE', 'ELLIPSE', 'POLYGON', 'STAR', 'LINE', 'VECTOR'];
+// Every node type that has `fills`, i.e. every type that can carry an image fill.
+const FILL_TYPES: NodeType[] = [
+  'FRAME', 'COMPONENT_SET', 'COMPONENT', 'INSTANCE', 'BOOLEAN_OPERATION', 'VECTOR', 'STAR',
+  'LINE', 'ELLIPSE', 'POLYGON', 'RECTANGLE', 'TEXT', 'TEXT_PATH', 'STICKY', 'SHAPE_WITH_TEXT',
+  'STAMP', 'SECTION', 'HIGHLIGHT', 'WASHI_TAPE', 'TABLE', 'SLIDE', 'SLOT'
+];
+
+/**
+ * Returns the node types a search type covers, or null for ANY (which has to visit every node).
+ */
+function typesFor(searchType: string): NodeType[] | null {
+  if (searchType === 'SECTION')   return ['SECTION'];
+  if (searchType === 'FRAME')     return FRAME_TYPES;
+  if (searchType === 'INSTANCE')  return ['INSTANCE'];
+  if (searchType === 'COMPONENT') return ['COMPONENT', 'COMPONENT_SET'];
+  if (searchType === 'TEXT')      return TEXT_TYPES;
+  if (searchType === 'SHAPE')     return SHAPE_TYPES;
+  if (searchType === 'IMAGE')     return FILL_TYPES;
+  return null;
+}
+
+function findAllOfTypes(root: ChildrenMixin, types: NodeType[]): readonly SceneNode[] {
+  try {
+    return root.findAllWithCriteria({ types }) as readonly SceneNode[];
+  } catch {
+    // Older Figma clients may reject node types they don't know yet (e.g. SLOT)
+    const wanted = new Set<string>(types);
+    return root.findAll(n => wanted.has(n.type));
+  }
+}
+
+/**
+ * Returns every descendant of `root` that `accept` keeps. Uses Figma's native type filter
+ * when the search type has one, so `accept` only runs on nodes of the right type.
+ */
+function findTyped(root: ChildrenMixin, searchType: string, accept: (n: SceneNode) => boolean): SceneNode[] {
+  const types = typesFor(searchType);
+  if (!types) return root.findAll(accept);
+  return findAllOfTypes(root, types).filter(accept);
 }
 
 function getCachedTypePool(
   parent: PageNode | SectionNode | FrameNode | InstanceNode | ComponentNode | ComponentSetNode,
-  types: string[],
+  types: NodeType[],
   fastMode: boolean
 ): readonly SceneNode[] {
   // Do not cache the heavy "all" traversal pools (flags mode) to avoid memory bloat and slowdowns
-  let pool = (parent as any).findAllWithCriteria({ types }) as readonly SceneNode[];
+  let pool = findAllOfTypes(parent, types);
   // In fast mode, prune hidden nodes (including those under hidden ancestors)
   if (fastMode) {
     pool = (pool as SceneNode[]).filter(n => isEffectivelyVisible(n)) as any;
@@ -144,23 +190,52 @@ function findMatchingDeep(
 ): readonly SceneNode[] {
   const gate = gateFor(type);
   const nameMatches = buildNameMatcher(nameQuery);
-  return (root as any).findAll((n: SceneNode) => {
+  return findTyped(root, type, (n: SceneNode) => {
     if (!includeHidden && !isEffectivelyVisible(n)) return false;
     if (type === 'SHAPE' && gateImage(n)) return false;
     if (type === 'IMAGE' && !gateImage(n)) return false;
     return gate(n) && nameMatches(n.name || '');
-  }) as readonly SceneNode[];
+  });
 }
+
+// Per-search memo of effective visibility by node id. Siblings share ancestors, so this
+// avoids re-walking the same parent chain for every node. Cleared after each search.
+const visibilityCache = new Map<string, boolean>();
 
 // Checks effective visibility by walking up ancestors (true only if all are visible)
 function isEffectivelyVisible(node: SceneNode): boolean {
+  const chain: string[] = [];
+  let result = true;
   let cur: BaseNode | null = node;
   while (cur && 'visible' in cur) {
-    const v = (cur as unknown as { visible: boolean }).visible;
-    if (!v) return false;
+    const cached = visibilityCache.get(cur.id);
+    if (cached !== undefined) { result = cached; break; }
+    chain.push(cur.id);
+    if (!(cur as unknown as { visible: boolean }).visible) { result = false; break; }
     cur = cur.parent;
   }
-  return true;
+  for (const id of chain) visibilityCache.set(id, result);
+  return result;
+}
+
+// Like isEffectivelyVisible, but only checks the layers between `node` and `root`
+// (exclusive). Matches what walk() reaches when it skips hidden layers below `root`.
+function visibleWithin(root: BaseNode): (node: SceneNode) => boolean {
+  const memo = new Map<string, boolean>();
+  return (node: SceneNode): boolean => {
+    const chain: string[] = [];
+    let result = true;
+    let cur: BaseNode | null = node;
+    while (cur && cur.id !== root.id && 'visible' in cur) {
+      const cached = memo.get(cur.id);
+      if (cached !== undefined) { result = cached; break; }
+      chain.push(cur.id);
+      if (!(cur as unknown as { visible: boolean }).visible) { result = false; break; }
+      cur = cur.parent;
+    }
+    for (const id of chain) memo.set(id, result);
+    return result;
+  };
 }
 
 /**
@@ -170,7 +245,7 @@ function isEffectivelyVisible(node: SceneNode): boolean {
 function symbolFor(n: BaseNode): string {
   if (n.type === 'PAGE') return '#';
   if (n.type === 'SECTION') return '$';
-  if (n.type === 'FRAME') return '@';
+  if (n.type === 'FRAME' || n.type === 'SLOT') return '@';
   if (n.type === 'INSTANCE') return '!';
   if (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') return '?';
   // IMAGE/SHAPE/TEXT are derived, not node types; symbols set when pushing results.
@@ -179,24 +254,24 @@ function symbolFor(n: BaseNode): string {
 
 /**
  * Collects the valid search scope anchors from current selection
- * Returns the selected nodes and their valid ancestors (Page, Section, Frame, Instance)
+ * Returns the selected nodes and their valid ancestors (Page, Section, Frame, Slot, Instance)
  * Used for determining where to search when layers are selected
  */
-function selectionAnchors(): (PageNode | SectionNode | FrameNode | InstanceNode)[] {
+function selectionAnchors(): (PageNode | SectionNode | FrameNode | SlotNode | InstanceNode)[] {
   const sel = figma.currentPage.selection as SceneNode[];
   if (!sel.length) return [figma.currentPage];
 
-  const keep = new Map<string, PageNode|SectionNode|FrameNode|InstanceNode>();
+  const keep = new Map<string, PageNode|SectionNode|FrameNode|SlotNode|InstanceNode>();
   for (const n of sel) {
     // Add the selected node itself if it's a valid anchor type
-    if (n.type === 'SECTION' || n.type === 'FRAME' || n.type === 'INSTANCE') {
+    if (n.type === 'SECTION' || n.type === 'FRAME' || n.type === 'SLOT' || n.type === 'INSTANCE') {
       keep.set(n.id, n as any);
     }
     
     // Also add all valid ancestors of this selected node
     let a: BaseNode | null = n;
     while (a && !(
-      a.type === 'PAGE' || a.type === 'SECTION' || a.type === 'FRAME' || a.type === 'INSTANCE'
+      a.type === 'PAGE' || a.type === 'SECTION' || a.type === 'FRAME' || a.type === 'SLOT' || a.type === 'INSTANCE'
     )) a = a.parent;
     const anchor = (a as any) || figma.currentPage;
     keep.set((anchor as any).id ?? 'page', anchor);
@@ -220,7 +295,6 @@ figma.on('selectionchange', sendSelectionLabel);
 
 interface SearchResult {
   node: SceneNode | PageNode | SectionNode;
-  path: string;
 }
 
 interface SearchModifiers {
@@ -294,11 +368,12 @@ figma.ui.onmessage = async (msg: { type: string; query?: string; outerWidth?: nu
   if (msg.type === 'search' && msg.query) {
     let originalSkipInvisible = figma.skipInvisibleInstanceChildren;
     try {
-      // Persist the last executed query
-      try { await figma.clientStorage.setAsync(LAST_QUERY_KEY, msg.query); } catch {}
+      // Persist the last executed query while the search runs; awaited before closing
+      const saveQuery = figma.clientStorage.setAsync(LAST_QUERY_KEY, msg.query).catch(() => {});
 
       // Reset cancel flag
       SEARCH_CANCELLED = false;
+      lastYieldAt = Date.now();
       
       // Parse modifiers from the end of the query
       const modifiers = parseModifiers(msg.query);
@@ -322,6 +397,7 @@ figma.ui.onmessage = async (msg: { type: string; query?: string; outerWidth?: nu
         try { searchCache.clear(); } catch {}
         try { nodeCache.clear(); } catch {}
         try { nameMatcherCache.clear(); } catch {}
+        try { visibilityCache.clear(); } catch {}
         STOP_ON_FIRST = false;
         FOUND_ONE = false;
         SEARCH_CANCELLED = false;
@@ -365,9 +441,11 @@ figma.ui.onmessage = async (msg: { type: string; query?: string; outerWidth?: nu
           ? `Found page and selected ${selectableNodes.length} ${selectableNodes.length === 1 ? 'layer' : 'layers'}`
           : `Found and selected ${selectableNodes.length} ${selectableNodes.length === 1 ? 'layer' : 'layers'}`;
         cleanup();
+        await saveQuery;
         figma.closePlugin(msg);
       } else if (movedToPage) {
         cleanup();
+        await saveQuery;
         figma.closePlugin('Found page');
       } else {
         figma.ui.postMessage({ type: 'searchComplete', count: 0, total: 0 });
@@ -380,6 +458,7 @@ figma.ui.onmessage = async (msg: { type: string; query?: string; outerWidth?: nu
       try { figma.skipInvisibleInstanceChildren = originalSkipInvisible; } catch {}
       try { searchCache.clear(); } catch {}
       try { nodeCache.clear(); } catch {}
+      try { visibilityCache.clear(); } catch {}
       STOP_ON_FIRST = false;
       FOUND_ONE = false;
       SEARCH_CANCELLED = false;
@@ -446,6 +525,7 @@ function getInitialScopes(excludeSelectedLayers: boolean = false): (SceneNode | 
           a.type === 'PAGE' ||
           a.type === 'SECTION' ||
           a.type === 'FRAME' ||
+          a.type === 'SLOT' ||
           a.type === 'INSTANCE' ||
           a.type === 'COMPONENT' ||
           a.type === 'COMPONENT_SET'
@@ -564,18 +644,15 @@ function matchesName(n: SceneNode, q: string): boolean {
 
 // Type filtering functions - determine if a node matches a specific search type
 const gateSection = (n: SceneNode) => n.type === 'SECTION';
-const gateFrame   = (n: SceneNode) => n.type === 'FRAME' || n.type === 'GROUP';
+const gateFrame   = (n: SceneNode) => FRAME_TYPES.indexOf(n.type) !== -1;
 const gateInst    = (n: SceneNode) => n.type === 'INSTANCE';
 const gateComp    = (n: SceneNode) => n.type === 'COMPONENT' || n.type === 'COMPONENT_SET';
-const gateShape   = (n: SceneNode) => (
-  n.type === 'RECTANGLE' || n.type === 'ELLIPSE' || n.type === 'POLYGON' ||
-  n.type === 'STAR' || n.type === 'LINE' || n.type === 'VECTOR'
-);
+const gateShape   = (n: SceneNode) => SHAPE_TYPES.indexOf(n.type) !== -1;
 const gateImage   = (n: SceneNode) => {
   const anyFill = (x:any)=> Array.isArray(x) && x.some((f:any)=>f?.type === 'IMAGE');
   return ('fills' in n && anyFill((n as any).fills));
 };
-const gateText    = (n: SceneNode) => n.type === 'TEXT';
+const gateText    = (n: SceneNode) => TEXT_TYPES.indexOf(n.type) !== -1;
 
 /**
  * Returns the appropriate type filter function based on search type
@@ -632,18 +709,11 @@ async function walk(root: ChildrenMixin, step:(n:SceneNode)=>boolean, modifiers?
       }
 
       // Periodically yield to allow UI events (cancel button) to process
-      const yieldEvery = getYieldEvery(modifiers);
-      if (i % yieldEvery === 0) {
+      if (shouldYield()) {
         // eslint-disable-next-line no-await-in-loop
         await yieldControl();
         if (SEARCH_CANCELLED) break;
       }
-    }
-    
-    // Yield control periodically to prevent UI blocking
-    if (stack.length > batchSize) {
-      // Small delay to prevent blocking
-      await new Promise(resolve => setTimeout(resolve, 0));
     }
   }
 }
@@ -654,7 +724,7 @@ async function walk(root: ChildrenMixin, step:(n:SceneNode)=>boolean, modifiers?
  * @param query - The search query (may contain modifiers like --f, --h, etc.)
  * @param movedToPage - Whether we've already switched to a target page
  * @param modifiers - Parsed search modifiers
- * @returns Array of search results with node and path information
+ * @returns Array of search results
  */
 async function performSearch(query: string, movedToPage: boolean = false, modifiers?: SearchModifiers): Promise<SearchResult[]> {
   // Visual order comparator used by --fe/--#e and by global --#.
@@ -1004,7 +1074,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
       p.type === 'PAGE' && pageNameMatches(p.name)
     );
     if (target) {
-      const result = [{ node: target, path: `#${target.name}` }];
+      const result = [{ node: target }];
       searchCache.set(cacheKey, result);
       return result;
     } else {
@@ -1049,7 +1119,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
         // This is just a fallback for complex queries
         const target = figma.root.children.find(p => nameMatches(p.name));
         if (!target) { results = []; currentScope = []; break; }
-        results = [{ node: target, path: `#${target.name}` }];
+        results = [{ node: target }];
         currentScope = [target];
       } else {
         // Determine if this is a child-only search (starts with /)
@@ -1084,7 +1154,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 }
               } else {
                 const fast = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-                const pool = (s as any).findAll((n: SceneNode) => {
+                const pool = findTyped(s as any, searchType, (n: SceneNode) => {
                   if (fast && !n.visible) return false;
                   if (searchType === 'SHAPE' && gateImage(n)) return false;
                   if (searchType === 'IMAGE' && !gateImage(n)) return false;
@@ -1101,7 +1171,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             const idxG = (inlineIdxGlobal === 0 ? sorted.length : inlineIdxGlobal);
             const pick = sorted[Math.max(0, idxG - 1)] || null;
             if (pick) {
-              results = [{ node: pick, path: getNodePath(pick) }];
+              results = [{ node: pick }];
               currentScope = [pick];
               continue;
             }
@@ -1143,11 +1213,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 }
               } else {
                 if (searchType === 'SECTION' || searchType === 'FRAME' || searchType === 'INSTANCE' || searchType === 'COMPONENT') {
-                  const types =
-                    searchType === 'SECTION'   ? ['SECTION'] :
-                    searchType === 'FRAME'     ? ['FRAME','GROUP'] :
-                    searchType === 'INSTANCE'  ? ['INSTANCE'] :
-                                                 ['COMPONENT','COMPONENT_SET'];
+                  const types = typesFor(searchType)!;
                   // When a quoted literal is present, prefer name-aware traversal to avoid stale cached pools
                   const hasQuoted = searchName.indexOf('"') !== -1;
                   const pool = hasQuoted
@@ -1168,7 +1234,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   }
                 } else {
                   const fast = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-                  const pool = (s as any).findAll((n: SceneNode) => {
+                  const pool = findTyped(s as any, searchType, (n: SceneNode) => {
                     if (fast && !n.visible) return false;
                     if (searchType === 'SHAPE' && gateImage(n)) return false;
                     if (searchType === 'IMAGE' && !gateImage(n)) return false;
@@ -1201,14 +1267,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               const sorted = sc.matches.slice().sort((a, b) => (rank.get(a.id)! - rank.get(b.id)!));
               const pick = sorted[nPick - 1] || null;
               if (pick && !seen.has(pick.id)) {
-                const sym = pick.type === 'SECTION' ? '$'
-                  : (pick.type === 'FRAME' || pick.type === 'GROUP') ? '@'
-                  : pick.type === 'INSTANCE' ? '!'
-                  : pick.type === 'TEXT' ? '='
-                  : (pick.type === 'COMPONENT' || pick.type === 'COMPONENT_SET') ? '?'
-                  : searchType === 'IMAGE' ? '&'
-                  : searchType === 'SHAPE' ? '%' : '';
-                perScope.push({ node: pick, path: `${getNodePath(sc.scope)}/${sym}${pick.name}` });
+                perScope.push({ node: pick });
                 seen.add(pick.id);
               }
             }
@@ -1235,14 +1294,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             const sortedSel = selMatches.slice().sort(buildRowComparator(selMatches));
             const pick = sortedSel[Math.max(0, indexToPickGlobal - 1)] || null;
             if (pick) {
-              const sym = pick.type === 'SECTION' ? '$'
-                : (pick.type === 'FRAME' || pick.type === 'GROUP') ? '@'
-                : pick.type === 'INSTANCE' ? '!'
-                : pick.type === 'TEXT' ? '='
-                : (pick.type === 'COMPONENT' || pick.type === 'COMPONENT_SET') ? '?'
-                : searchType === 'IMAGE' ? '&'
-                : searchType === 'SHAPE' ? '%' : '';
-              rootResults.push({ node: pick, path: getNodePath(pick) });
+              rootResults.push({ node: pick });
               results = rootResults;
               currentScope = rootResults.map(r => r.node);
               // Skip normal per-scope processing; we already produced the indexed selection
@@ -1287,11 +1339,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 }
               } else {
                 if (searchType === 'SECTION' || searchType === 'FRAME' || searchType === 'INSTANCE' || searchType === 'COMPONENT') {
-                  const types =
-                    searchType === 'SECTION'   ? ['SECTION'] :
-                    searchType === 'FRAME'     ? ['FRAME','GROUP'] :
-                    searchType === 'INSTANCE'  ? ['INSTANCE'] :
-                                                 ['COMPONENT','COMPONENT_SET'];
+                  const types = typesFor(searchType)!;
                   const hasQuoted = searchName.indexOf('"') !== -1;
                   const pool = hasQuoted
                     ? findMatchingDeep(s as any, searchType, searchName, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
@@ -1311,7 +1359,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   }
                 } else {
                   const fast = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-                  const pool = (s as any).findAll((n: SceneNode) => {
+                  const pool = findTyped(s as any, searchType, (n: SceneNode) => {
                     if (fast && !n.visible) return false;
                     if (searchType === 'SHAPE' && gateImage(n)) return false;
                     if (searchType === 'IMAGE' && !gateImage(n)) return false;
@@ -1357,14 +1405,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               const idxE = (inlineIdxEach === 0 ? mineSorted.length : (inlineIdxEach ?? 1));
               const pick = mineSorted[Math.max(0, idxE - 1)] || null;
               if (pick && !pickedIdsRoot.has(pick.id)) {
-                const sym = pick.type === 'SECTION' ? '$'
-                  : (pick.type === 'FRAME' || pick.type === 'GROUP') ? '@'
-                  : pick.type === 'INSTANCE' ? '!'
-                  : pick.type === 'TEXT' ? '='
-                  : (pick.type === 'COMPONENT' || pick.type === 'COMPONENT_SET') ? '?'
-                  : searchType === 'IMAGE' ? '&'
-                  : searchType === 'SHAPE' ? '%' : '';
-                rootResults.push({ node: pick, path: `${getNodePath(s)}/${sym}${pick.name}` });
+                rootResults.push({ node: pick });
                 pickedIdsRoot.add(pick.id);
               }
             }
@@ -1393,13 +1434,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               }
               
               if (shouldInclude) {
-                const sym = s.type === 'SECTION' ? '$'
-                  : (s.type === 'FRAME' || s.type === 'GROUP') ? '@'
-                  : s.type === 'INSTANCE' ? '!' 
-                  : (s.type === 'COMPONENT' || s.type === 'COMPONENT_SET') ? '?'
-                  : searchType === 'IMAGE' ? '&'
-                  : searchType === 'SHAPE' ? '%' : '';
-                rootResults.push({ node: s, path: getNodePath(s) });
+                rootResults.push({ node: s });
                 FOUND_ONE = true;
                 if (stopThisPart) continue;
                 if (stopThisPartEach) continue; // Stop searching this scope, but continue with other scopes
@@ -1426,11 +1461,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               continue;
             }
             if (searchType === 'SECTION' || searchType === 'FRAME' || searchType === 'INSTANCE' || searchType === 'COMPONENT') {
-              const types =
-                searchType === 'SECTION'   ? ['SECTION'] :
-                searchType === 'FRAME'     ? ['FRAME','GROUP'] :
-                searchType === 'INSTANCE'  ? ['INSTANCE'] :
-                                             ['COMPONENT','COMPONENT_SET'];
+              const types = typesFor(searchType)!;
 
               // Use name-aware traversal when quoted to ensure literal matches; otherwise use cached pool
               const hasQuoted = searchName.indexOf('"') !== -1;
@@ -1438,7 +1469,6 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                 ? findMatchingDeep(s as any, searchType, searchName, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
                 : getCachedTypePool(s as any, types, fastMode);
 
-              const yieldEveryPool = getYieldEvery(modifiers);
               for (let idx = 0; idx < pool.length; idx++) {
                 const n = pool[idx];
                 if (SEARCH_CANCELLED) break;
@@ -1458,18 +1488,13 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   }
                   
                   if (shouldInclude) {
-                    const sym = n.type === 'SECTION' ? '$'
-                      : (n.type === 'FRAME' || n.type === 'GROUP') ? '@'
-                      : n.type === 'INSTANCE' ? '!'
-                      : n.type === 'TEXT' ? '='
-                      : (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') ? '?' : '';
-                    rootResults.push({ node: n, path: `${getNodePath(s)}/${sym}${n.name}` });
+                    rootResults.push({ node: n });
                     FOUND_ONE = true;
                     if (stopThisPart) break;
                     if (stopThisPartEach) break; // Stop searching this scope for --fe
                   }
                 }
-                if (idx % yieldEveryPool === 0) {
+                if (shouldYield()) {
                   // eslint-disable-next-line no-await-in-loop
                   await yieldControl();
                   if (SEARCH_CANCELLED) break;
@@ -1479,23 +1504,15 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               if (fastMode) {
                 // Use the built-in fast deep finder in fast mode
                 const pool = findMatchingDeep(s as any, searchType, searchName, !!(modifiers?.hiddenOnly || modifiers?.allLayers));
-                const yieldEveryDeep = getYieldEvery(modifiers);
                 for (let idx = 0; idx < pool.length; idx++) {
                   const n = pool[idx];
                   if (SEARCH_CANCELLED) break;
                   if (!modifiers?.allLayers && !modifiers?.hiddenOnly && !isEffectivelyVisible(n)) continue;
-                  const sym =
-                    searchType === 'IMAGE' ? '&' :
-                    searchType === 'SHAPE' ? '%' :
-                    n.type === 'SECTION' ? '$' :
-                    n.type === 'FRAME'   ? '@' :
-                    n.type === 'INSTANCE'? '!' :
-                    (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') ? '?' : '';
-                  rootResults.push({ node: n, path: `${getNodePath(s)}/${sym}${n.name}` });
+                  rootResults.push({ node: n });
                   FOUND_ONE = true;
                   if (stopThisPart) break;
                   if (stopThisPartEach) break;
-                  if (idx % yieldEveryDeep === 0) {
+                  if (shouldYield()) {
                     // eslint-disable-next-line no-await-in-loop
                     await yieldControl();
                     if (SEARCH_CANCELLED) break;
@@ -1506,7 +1523,6 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
                   s as any,
                   searchType,
                   searchName,
-                  getNodePath(s),
                   rootResults,
                   stopThisPart || stopThisPartEach,
                   modifiers,
@@ -1552,7 +1568,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
           } else {
             // Collect all matches within this scope (respecting visibility flags similarly to findFirstMatchInScope)
             const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-            const pool = (parent as any).findAll((n: SceneNode) => {
+            const pool = findTyped(parent as any, searchType, (n: SceneNode) => {
               if (fastMode && !n.visible) return false;
               if (searchType === 'SHAPE' && gateImage(n)) return false;
               if (searchType === 'IMAGE' && !gateImage(n)) return false;
@@ -1581,15 +1597,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             const idxE2 = (indexToPick === 0 ? sorted.length : indexToPick);
             const pick = sorted[Math.max(0, idxE2 - 1)] || null;
             if (pick) {
-              const sym =
-                searchType === 'IMAGE' ? '&' :
-                searchType === 'SHAPE' ? '%' :
-                pick.type === 'TEXT' ? '=' :
-                pick.type === 'SECTION' ? '$' :
-                pick.type === 'FRAME'   ? '@' :
-                pick.type === 'INSTANCE'? '!' :
-                (pick.type === 'COMPONENT' || pick.type === 'COMPONENT_SET') ? '?' : '';
-              perScope.push({ node: pick, path: `${getNodePath(parent)}/${sym}${pick.name}` });
+              perScope.push({ node: pick });
             }
           }
         }
@@ -1618,7 +1626,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
               }
             } else {
               const fastModeLocal = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-              const pool = (parent as any).findAll((n: SceneNode) => {
+              const pool = findTyped(parent as any, searchType, (n: SceneNode) => {
                 if (fastModeLocal && !n.visible) return false;
                 if (searchType === 'SHAPE' && gateImage(n)) return false;
                 if (searchType === 'IMAGE' && !gateImage(n)) return false;
@@ -1634,7 +1642,7 @@ async function performSearch(query: string, movedToPage: boolean = false, modifi
             const idxG = (inlineIdxGlobal === 0 ? sorted.length : inlineIdxGlobal);
             const pick = sorted[Math.max(0, idxG - 1)] || null;
             if (pick) {
-              results = [{ node: pick, path: `${getNodePath(pick)}` }];
+              results = [{ node: pick }];
               currentScope = [pick];
               continue;
             }
@@ -1710,8 +1718,8 @@ function findFirstMatchInScope(
   const gate = gateFor(type);
   const q = name.toLowerCase();
   const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-  // Use built-in findAll for fast enumeration, then pick first
-  const pool = (scope as any).findAll((n: SceneNode) => {
+  // Use the native type filter for fast enumeration, then pick first
+  const pool = findTyped(scope as any, type, (n: SceneNode) => {
     if (fastMode && !n.visible) return false;
     if (type === 'SHAPE' && gateImage(n)) return false;
     if (type === 'IMAGE' && !gateImage(n)) return false;
@@ -1754,129 +1762,6 @@ function getSearchName(part: string): string {
 }
 
 /**
- * Searches for nodes at the root level (pages, sections, or current page)
- * @param type - The type of node to search for
- * @param name - The name to search for
- * @param modifiers - Search modifiers for visibility filtering
- * @returns Array of search results
- */
-async function searchAtRoot(type: string, name: string, modifiers?: SearchModifiers): Promise<SearchResult[]> {
-  const results: SearchResult[] = [];
-  const nameMatches = buildNameMatcher(name);
-  
-  if (type === 'PAGE') {
-    // Search through all pages in the document
-    const pages = figma.root.children;
-    for (const page of pages) {
-      if (nameMatches(page.name)) {
-        results.push({ node: page, path: `#${page.name}` });
-      }
-    }
-  } else if (type === 'SECTION') {
-    // For sections, search only in the current page
-    const currentPage = figma.currentPage;
-    
-    for (const child of currentPage.children) {
-      if (child.type === 'SECTION' && nameMatches(child.name)) {
-        results.push({ node: child, path: `#${currentPage.name}/${child.name}` });
-      }
-    }
-  } else {
-    // For other types, search in the current page
-    const currentPage = figma.currentPage;
-    const pageResults = await searchInPage(currentPage, type, name, modifiers);
-    results.push(...pageResults);
-  }
-  
-  return results;
-}
-
-/**
- * Searches for nodes within a specific page
- * @param page - The page to search in
- * @param type - The type of node to search for
- * @param name - The name to search for
- * @param modifiers - Search modifiers for visibility filtering
- * @returns Array of search results
- */
-async function searchInPage(page: PageNode, type: string, name: string, modifiers?: SearchModifiers): Promise<SearchResult[]> {
-  const results: SearchResult[] = [];
-  const hasQuoted = name.indexOf('"') !== -1;
-  const nameMatchesFn = buildNameMatcher(name);
-
-  if (type === 'SECTION' || type === 'FRAME' || type === 'INSTANCE' || type === 'COMPONENT') {
-    const types =
-      type === 'SECTION'   ? ['SECTION'] :
-      type === 'FRAME'     ? ['FRAME','GROUP'] :
-      type === 'INSTANCE'  ? ['INSTANCE'] :
-      /* COMPONENT */        ['COMPONENT','COMPONENT_SET'];
-
-    const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-    const pool = hasQuoted
-      ? findMatchingDeep(page as any, type, name, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
-      : getCachedTypePool(page as any, types, fastMode);
-    for (const n of pool as any) {
-      if (nameMatchesFn((n as SceneNode).name || '')) {
-        // Respect visibility flags similar to other code paths
-        let shouldInclude = false;
-        const isVisible = n.visible;
-        // As this is a root-level search within a page (first part), treat as intermediate unless it's the only part
-        const isLastPartAssumed = true; // searchInPage is used when no further parts are parsed at this stage
-        if (isLastPartAssumed) {
-          if (modifiers?.hiddenOnly) {
-            shouldInclude = !isVisible;
-          } else if (modifiers?.allLayers) {
-            shouldInclude = true;
-          } else {
-            shouldInclude = isVisible;
-          }
-        } else {
-          if (modifiers?.hiddenOnly || modifiers?.allLayers) {
-            shouldInclude = true;
-          } else {
-            shouldInclude = isVisible;
-          }
-        }
-        if (shouldInclude) {
-          const sym = n.type === 'SECTION' ? '$' :
-                      (n.type === 'FRAME' || n.type === 'GROUP') ? '@' :
-                      n.type === 'INSTANCE' ? '!' :
-                      n.type === 'TEXT' ? '=' :
-                      (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') ? '?' : '';
-          results.push({ node: n, path: `#${page.name}/${sym}${n.name}` });
-        }
-      }
-    }
-    return results;
-  }
-
-  // For IMAGE, SHAPE, and ANY types, use gated walk
-  const gate = gateFor(type);
-  const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
-  await walk(page, (n) => {
-    if (fastMode && !n.visible) return true; // prune hidden early in fast mode
-    if (type === 'SHAPE' && gateImage(n)) return true;
-    if (type === 'IMAGE' && !gateImage(n)) return true;
-
-    if (gate(n) && nameMatchesFn(n.name || '')) {
-      const sym =
-        type === 'IMAGE' ? '&' :
-        type === 'SHAPE' ? '%' :
-        type === 'TEXT' ? '=' :
-        n.type === 'SECTION' ? '$' :
-        n.type === 'FRAME'   ? '@' :
-        n.type === 'INSTANCE'? '!' :
-        (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') ? '?' : '';
-      results.push({ node: n, path: `#${page.name}/${sym}${n.name}` });
-      return false; // Don't search children of matching nodes
-    }
-    return true;
-  }, modifiers);
-
-  return results;
-}
-
-/**
  * Searches for child nodes within a parent node
  * @param parent - The parent node to search within
  * @param type - The type of node to search for
@@ -1888,7 +1773,6 @@ async function searchInPage(page: PageNode, type: string, name: string, modifier
  */
 async function searchChildren(parent: SceneNode|PageNode|SectionNode, type: string, name: string, stopOnFirst: boolean, modifiers?: SearchModifiers, isDirectChild: boolean = false, isFinalPart: boolean = false): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
-  const basePath = getNodePath(parent);
   if ('children' in parent) {
     const firstEachFinal = !!(stopOnFirst && modifiers?.firstMatchEach && isFinalPart);
 
@@ -1897,15 +1781,7 @@ async function searchChildren(parent: SceneNode|PageNode|SectionNode, type: stri
     if (firstEachFinal && !isDirectChild) {
       const match = findFirstMatchInScope(parent as any, type, name, modifiers);
       if (match) {
-        const sym =
-          type === 'IMAGE' ? '&' :
-          type === 'SHAPE' ? '%' :
-          match.type === 'SECTION' ? '$' :
-          match.type === 'FRAME'   ? '@' :
-          match.type === 'INSTANCE'? '!' :
-          (match.type === 'COMPONENT' || match.type === 'COMPONENT_SET') ? '?' :
-          match.type === 'TEXT' ? '=' : '';
-        results.push({ node: match, path: `${basePath}/${sym}${match.name}` });
+        results.push({ node: match });
         return results;
       }
       return results;
@@ -1914,17 +1790,12 @@ async function searchChildren(parent: SceneNode|PageNode|SectionNode, type: stri
     // Optimized path for non-direct child searches of common types
     const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
     if (!isDirectChild && (type === 'SECTION' || type === 'FRAME' || type === 'INSTANCE' || type === 'COMPONENT')) {
-      const types =
-        type === 'SECTION'   ? ['SECTION'] :
-        type === 'FRAME'     ? ['FRAME','GROUP'] :
-        type === 'INSTANCE'  ? ['INSTANCE'] :
-                               ['COMPONENT','COMPONENT_SET'];
+      const types = typesFor(type)!;
 
     const hasQuoted = name.indexOf('"') !== -1;
     const pool = hasQuoted
       ? findMatchingDeep(parent as any, type, name, !!(modifiers?.hiddenOnly || modifiers?.allLayers))
       : getCachedTypePool(parent as any, types, fastMode);
-      const yieldEvery = getYieldEvery(modifiers);
     for (let idx = 0; idx < pool.length; idx++) {
         const n = pool[idx];
         if (SEARCH_CANCELLED) break;
@@ -1944,12 +1815,7 @@ async function searchChildren(parent: SceneNode|PageNode|SectionNode, type: stri
           }
 
           if (shouldInclude) {
-            const sym = n.type === 'SECTION' ? '$'
-              : (n.type === 'FRAME' || n.type === 'GROUP') ? '@'
-              : n.type === 'INSTANCE' ? '!'
-              : n.type === 'TEXT' ? '='
-              : (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') ? '?' : '';
-            results.push({ node: n, path: `${basePath}/${sym}${n.name}` });
+            results.push({ node: n });
             if (stopOnFirst) {
               if (modifiers?.firstMatch) {
                 FOUND_ONE = true;
@@ -1960,14 +1826,14 @@ async function searchChildren(parent: SceneNode|PageNode|SectionNode, type: stri
             }
           }
         }
-        if (idx % yieldEvery === 0) {
+        if (shouldYield()) {
           // eslint-disable-next-line no-await-in-loop
           await yieldControl();
           if (SEARCH_CANCELLED) break;
         }
       }
     } else {
-      await searchNodesRecursive(parent as any, type, name, basePath, results, stopOnFirst, modifiers, isDirectChild, isFinalPart);
+      await searchNodesRecursive(parent as any, type, name, results, stopOnFirst, modifiers, isDirectChild, isFinalPart);
     }
   }
   return results;
@@ -1979,7 +1845,6 @@ async function searchChildren(parent: SceneNode|PageNode|SectionNode, type: stri
  * @param node - The node to search within
  * @param type - The type of node to search for
  * @param name - The name to search for
- * @param currentPath - The current path for building result paths
  * @param results - Array to collect search results
  * @param stopOnFirst - Whether to stop at the first match
  * @param modifiers - Search modifiers for visibility filtering
@@ -1990,7 +1855,6 @@ async function searchNodesRecursive(
   node: BaseNode & ChildrenMixin,
   type: string,
   name: string,
-  currentPath: string,
   results: SearchResult[],
   stopOnFirst: boolean = false,
   modifiers?: SearchModifiers,
@@ -2017,15 +1881,7 @@ async function searchNodesRecursive(
         // Apply --h constraint only to final part when checking matches
         if (isMatch && isFinalPart && modifiers?.hiddenOnly && child.visible) continue;
         if (isMatch) {
-          const sym =
-            type === 'IMAGE' ? '&' :
-            type === 'SHAPE' ? '%' :
-            type === 'TEXT' ? '=' :
-            child.type === 'SECTION' ? '$' :
-            child.type === 'FRAME'   ? '@' :
-            child.type === 'INSTANCE'? '!' :
-            (child.type === 'COMPONENT' || child.type === 'COMPONENT_SET') ? '?' : '';
-          results.push({ node: child, path: `${currentPath}/${sym}${child.name}` });
+          results.push({ node: child });
 
           if (stopOnFirst) {
             if (modifiers?.firstMatch) {
@@ -2037,12 +1893,42 @@ async function searchNodesRecursive(
           }
         }
 
-        if (ci % YIELD_INTERVAL === 0) {
+        if (shouldYield()) {
           // eslint-disable-next-line no-await-in-loop
           await yieldControl();
           if (SEARCH_CANCELLED) break;
         }
       }
+    }
+  } else if (!stopOnFirst && (type === 'TEXT' || type === 'SHAPE' || type === 'IMAGE')) {
+    // Same matches as the walk() below, but Figma filters node types natively.
+    // walk() never searches inside a match: text and shape layers have no children,
+    // and image matches nested inside another image match are dropped below.
+    const fastMode = !(modifiers?.hiddenOnly || modifiers?.allLayers);
+    const isVisible = visibleWithin(node);
+    const matched: SceneNode[] = [];
+    for (const n of findAllOfTypes(node, typesFor(type)!)) {
+      if (SEARCH_CANCELLED) break;
+      if (shouldYield()) {
+        // eslint-disable-next-line no-await-in-loop
+        await yieldControl();
+        if (SEARCH_CANCELLED) break;
+      }
+      if (fastMode && !isVisible(n)) continue;
+      if (type === 'SHAPE' && gateImage(n)) continue;
+      if (type === 'IMAGE' && !gateImage(n)) continue;
+      if (!gate(n) || !matchesName(n, name)) continue;
+      // Apply --h constraint only to final part when checking matches
+      if (isFinalPart && modifiers?.hiddenOnly && n.visible) continue;
+      matched.push(n);
+    }
+    const matchedIds = type === 'IMAGE' ? new Set(matched.map(n => n.id)) : null;
+    for (const n of matched) {
+      let nested = false;
+      for (let p = n.parent; matchedIds && p && p.id !== node.id; p = p.parent) {
+        if (matchedIds.has(p.id)) { nested = true; break; }
+      }
+      if (!nested) results.push({ node: n });
     }
   } else {
     // Use the existing recursive walk for deep searches
@@ -2054,14 +1940,7 @@ async function searchNodesRecursive(
     // Apply --h constraint only to final part when checking matches
     if (isMatch && isFinalPart && modifiers?.hiddenOnly && n.visible) return true; // Skip this match but continue searching
     if (isMatch) {
-      const sym =
-        type === 'IMAGE' ? '&' :
-        type === 'SHAPE' ? '%' :
-        n.type === 'SECTION' ? '$' :
-        n.type === 'FRAME'   ? '@' :
-        n.type === 'INSTANCE'? '!' :
-        (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') ? '?' : '';
-      results.push({ node: n, path: `${currentPath}/${sym}${n.name}` });
+      results.push({ node: n });
 
       if (stopOnFirst) {
         if (modifiers?.firstMatch) {
@@ -2080,31 +1959,4 @@ async function searchNodesRecursive(
   // For --fe, don't set global FOUND_ONE to allow continuing with other scopes
 }
 
-/**
- * Builds a path string representing the hierarchy to a node
- * @param node - The node to build a path for
- * @returns A path string like "#Page/$Section/@Frame"
- */
-function getNodePath(node: SceneNode | PageNode | SectionNode): string {
-  const parts: string[] = [];
-  let current: BaseNode | null = node;
-  
-  while (current) {
-    let symbol = '';
-    if (current.type === 'PAGE') symbol = '#';
-    else if (current.type === 'SECTION') symbol = '$';
-    else if (current.type === 'FRAME') symbol = '@';
-    else if (current.type === 'INSTANCE') symbol = '!';
-    else if (current.type === 'COMPONENT') symbol = '?';
-    else if (current.type === 'TEXT') symbol = '=';
-    
-    if (symbol) {
-      parts.unshift(`${symbol}${current.name}`);
-    }
-    
-    current = current.parent;
-  }
-  
-  return parts.join('/');
-}
 
